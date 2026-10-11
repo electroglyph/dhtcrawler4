@@ -40,7 +40,7 @@ use crate::state::{self, FamilyState, MAX_SAVED_NODES, STATE_VERSION, SavedNode,
 use crate::stats::{Counters, DhtStatsSnapshot, DropReason, incr};
 use crate::token::TokenSecrets;
 use crate::util::{after, after_skip, lock, remaining_budget};
-use crate::{Discovered, Error};
+use crate::{Discovered, Error, Source};
 use lru::LruCache;
 
 /// Good routing-table nodes wanted per family: bootstrap continues below
@@ -401,6 +401,18 @@ impl Inner {
 
     pub(crate) fn socket(&self, family: Family) -> Option<&Arc<SocketNode>> {
         self.sockets.iter().find(|s| s.family == family)
+    }
+
+    /// Records a sighting of life for sampler live-probing.
+    /// Pre-filtered by the address chokepoint; the query path re-checks
+    /// anyway. Silent when the sampler is off.
+    pub(crate) fn offer_live(&self, addr: SocketAddr) {
+        if !self.policy.dialable(&addr) {
+            return;
+        }
+        if let Some(sampler) = self.sampler.as_ref() {
+            sampler.offer_live(addr);
+        }
     }
 
     /// Cached closest nodes for `key`, as the start set of a repeat scrape
@@ -1167,6 +1179,11 @@ impl Inner {
             responder::answer(&ctx, tid, query, &shared.tokens, &mut shared.store)
         };
         if let Some(event) = answer.event {
+            // an inbound announce endpoint just
+            // proved itself live — feed the sampler's live ring.
+            if event.source == Source::Announce {
+                self.offer_live(from);
+            }
             self.emit(event);
         }
         if answer.is_error {

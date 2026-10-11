@@ -147,7 +147,10 @@ impl DhtConfig {
 
 /// Timers and limits. `Default` gives the production values; tests shorten
 /// the timers so a private network converges in seconds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+//
+// No `Eq`: `sampler_live_share: f64` cannot be `Eq`, and NaN
+// must be rejectable — not silently unequal.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DhtTuning {
     /// How long to wait for the reply to one query. There are no retries (BEP 5). Production: 4 s.
     pub query_timeout: Duration,
@@ -229,6 +232,11 @@ pub struct DhtTuning {
     /// per-IP rate limits, external-IP vote diversity and the "our own
     /// address" rule. This lets many nodes share 127.0.0.1. Production: false.
     pub limits_by_endpoint: bool,
+    /// Fraction of sampler picks that probe a live address directly instead
+    /// of traversing the frontier. Live addresses hold stores
+    /// biased toward live swarms; uniform-node samples are mostly dead.
+    /// Validated manually to 0.0..=1.0 (NaN rejected). Production: 0.10.
+    pub sampler_live_share: f64,
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -272,6 +280,7 @@ impl Default for DhtTuning {
             scrape_early_exit_quorum: 3,
             scrape_node_cache_keys: 4096,
             limits_by_endpoint: false,
+            sampler_live_share: 0.10,
         }
     }
 }
@@ -312,6 +321,13 @@ impl DhtTuning {
         if self.bootstrap_retry_max < self.bootstrap_retry_base {
             return Err(Error::Config(
                 "tuning.bootstrap_retry_max must be at least bootstrap_retry_base".into(),
+            ));
+        }
+        // Manual, not a generic range check: NaN must be rejected, and NaN
+        // slips through `<`/`>` comparisons. `contains` fails NaN.
+        if !(0.0..=1.0).contains(&self.sampler_live_share) {
+            return Err(Error::Config(
+                "tuning.sampler_live_share must be between 0.0 and 1.0".into(),
             ));
         }
         if self.sample_interval_sent
@@ -446,6 +462,32 @@ mod tests {
         assert!(c.validate().is_ok());
         let bad = DhtConfig {
             fetch_packets_per_sec: 0,
+            ..DhtConfig::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn sampler_live_share_defaults_and_rejects_nan() {
+        // 10% of sampler picks probe live addrs; NaN would
+        // silently disable or misbehave, so it is rejected explicitly.
+        assert_eq!(DhtTuning::default().sampler_live_share, 0.10);
+        let mut tuning = DhtTuning::default();
+        tuning.sampler_live_share = f64::NAN;
+        let bad = DhtConfig {
+            tuning: tuning.clone(),
+            ..DhtConfig::default()
+        };
+        assert!(bad.validate().is_err());
+        tuning.sampler_live_share = 1.01;
+        let bad = DhtConfig {
+            tuning: tuning.clone(),
+            ..DhtConfig::default()
+        };
+        assert!(bad.validate().is_err());
+        tuning.sampler_live_share = -0.5;
+        let bad = DhtConfig {
+            tuning,
             ..DhtConfig::default()
         };
         assert!(bad.validate().is_err());

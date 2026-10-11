@@ -39,6 +39,10 @@ pub trait PeerSource: Clone + Send + Sync + 'static {
     fn own_ips(&self) -> Vec<IpAddr>;
     /// Our own bound socket addresses.
     fn own_endpoints(&self) -> Vec<SocketAddr>;
+    /// Records a sighting of life for sampler live-probing:
+    /// the sampler spends `sampler_live_share` of picks querying these
+    /// addrs directly. Default is a no-op so test doubles are unaffected.
+    fn note_live_addr(&self, _addr: SocketAddr) {}
 }
 
 impl PeerSource for dc4_dht::Dht {
@@ -70,6 +74,10 @@ impl PeerSource for dc4_dht::Dht {
 
     fn own_endpoints(&self) -> Vec<SocketAddr> {
         self.local_addrs()
+    }
+
+    fn note_live_addr(&self, addr: SocketAddr) {
+        dc4_dht::Dht::note_live_addr(self, addr);
     }
 }
 

@@ -938,7 +938,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                     Ok(permit) => {
                         attempts = attempts.saturating_add(1);
                         metrics::counter!(METRIC_DIALS, "est" => bucket).increment(1);
-                        running.push(self.attempt(peer, key, permit));
+                        running.push(async move { (peer, self.attempt(peer, key, permit).await) });
                     }
                     Err(denied) => {
                         metrics::counter!(METRIC_DESTINATION_SKIPPED, "reason" => denied.as_str())
@@ -1005,10 +1005,17 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                         }
                     }
                 }
-                Some(result) = running.next(), if !running.is_empty() => {
+                Some((peer, result)) = running.next(), if !running.is_empty() => {
                     progress = progress.saturating_add(1);
                     match result {
-                        Ok(info) => return Obtained::Metadata(info),
+                        Ok(info) => {
+                            // a peer that served
+                            // metadata just proved live — feed the sampler's
+                            // live ring (hint-connected peers included: a
+                            // successful dial connected by definition).
+                            self.peers.note_live_addr(peer);
+                            return Obtained::Metadata(info);
+                        }
                         Err(e) => tracing::debug!(reason = e.label(), "peer fetch failed"),
                     }
                 }

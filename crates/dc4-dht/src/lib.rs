@@ -323,6 +323,14 @@ impl Dht {
         self.inner.stats()
     }
 
+    /// Records a sighting of life for sampler live-probing:
+    /// call with peers of successful fetches and connected hint peers. The
+    /// sampler spends `sampler_live_share` of picks querying these addrs
+    /// directly; dead ones are evicted after consecutive failures.
+    pub fn note_live_addr(&self, addr: SocketAddr) {
+        self.inner.offer_live(addr);
+    }
+
     /// The bound socket addresses (with the actual ports).
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
         self.inner.sockets.iter().map(|s| s.local_addr).collect()

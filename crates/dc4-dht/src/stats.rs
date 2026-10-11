@@ -215,6 +215,9 @@ pub struct DhtStatsSnapshot {
     /// Sampler picks that found nothing to sample
     /// (`dc4_dht_sampler_pick_empty_total`).
     pub sampler_pick_empty: u64,
+    /// Live sampler addresses evicted after consecutive failures
+    /// (`dc4_dht_sampler_live_evicted_total`).
+    pub sampler_live_evicted: u64,
     /// Queries dropped unanswered by the responder budget, both families
     /// (`dc4_dht_responder_dropped_total`).
     pub responder_dropped: u64,
@@ -410,6 +413,7 @@ pub(crate) struct Counters {
     pub(crate) sampler_early: AtomicU64,
     pub(crate) sampler_visited_full: AtomicU64,
     pub(crate) sampler_pick_empty: AtomicU64,
+    pub(crate) sampler_live_evicted: AtomicU64,
 }
 
 /// Adds one (wrapping, never panicking).
@@ -458,6 +462,7 @@ impl Counters {
             sampler_early: get(&self.sampler_early),
             sampler_visited_full: get(&self.sampler_visited_full),
             sampler_pick_empty: get(&self.sampler_pick_empty),
+            sampler_live_evicted: get(&self.sampler_live_evicted),
             peer_store_keys: 0,
         }
     }

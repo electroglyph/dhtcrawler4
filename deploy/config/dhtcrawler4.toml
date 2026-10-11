@@ -50,6 +50,11 @@ max_packets_per_sec = 12000
 # roughly concurrency / 2 s sends (sampler queries time out after 2 s),
 # so this floors worst-case discovery.
 sampler_concurrency = 1024
+# Fraction of sampler picks that probe a live address directly instead of
+# traversing the frontier (0.0-1.0; 0 disables). Live stores skew toward
+# live swarms; uniform-node samples are mostly dead. A reallocation inside
+# existing budgets, not additional traffic.
+sampler_live_share = 0.1
 # Answer no DHT queries and mark ours read-only (BEP 43). Leave false to be a
 # full, reciprocating DHT node.
 read_only = false

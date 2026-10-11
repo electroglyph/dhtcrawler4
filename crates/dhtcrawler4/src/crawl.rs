@@ -121,6 +121,7 @@ impl CrawlOptions {
         };
         dht.tuning.scrape_early_exit_quorum =
             usize::try_from(c.scrape_early_exit_quorum).unwrap_or(usize::MAX);
+        dht.tuning.sampler_live_share = c.sampler_live_share;
         dht.bep42_r = c.bep42_r;
         dht.tuning.scrape_query_timeout = Duration::from_secs(c.scrape_query_timeout_secs);
         dht.tuning.scrape_node_cache_keys = c.scrape_node_cache_keys;
@@ -385,6 +386,7 @@ pub fn export_snapshot(s: &DhtStatsSnapshot) {
     metrics::counter!("dc4_dht_sampler_early_total").absolute(s.sampler_early);
     metrics::counter!("dc4_dht_sampler_visited_full_total").absolute(s.sampler_visited_full);
     metrics::counter!("dc4_dht_sampler_pick_empty_total").absolute(s.sampler_pick_empty);
+    metrics::counter!("dc4_dht_sampler_live_evicted_total").absolute(s.sampler_live_evicted);
     metrics::counter!("dc4_dht_responder_dropped_total").absolute(s.responder_dropped);
     metrics::counter!("dc4_dht_discovered_dropped_total").absolute(s.discovered_dropped);
     metrics::gauge!("dc4_dht_peer_store_keys").set(s.peer_store_keys as f64);
@@ -529,6 +531,7 @@ mod tests {
             o.dht.fetch_packets_per_sec,
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
+        assert_eq!(o.dht.tuning.sampler_live_share, 0.10);
         assert_eq!(o.dht.tuning.scrape_early_exit_quorum, 3);
         assert_eq!(o.dht.tuning.scrape_query_timeout, Duration::from_secs(10));
         assert_eq!(o.dht.tuning.scrape_node_cache_keys, 4096);

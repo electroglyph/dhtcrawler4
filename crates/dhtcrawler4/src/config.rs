@@ -96,7 +96,9 @@ pub enum ConfigError {
 }
 
 /// The whole configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+//
+// No `Eq`: `crawl.sampler_live_share: f64` cannot be `Eq`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub database: DatabaseConfig,
@@ -162,7 +164,9 @@ pub struct RoleCredentials {
 }
 
 /// `[crawl]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+//
+// No `Eq`: `sampler_live_share: f64` cannot be `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CrawlConfig {
     pub dht_port: u16,
@@ -176,6 +180,11 @@ pub struct CrawlConfig {
     pub max_packets_per_sec: u32,
     /// Concurrent BEP 51 queries.
     pub sampler_concurrency: usize,
+    /// Fraction of sampler picks that probe a live address directly instead
+    /// of traversing the frontier (default 0.10). Validated
+    /// manually to 0.0..=1.0 (NaN rejected) — `check_range` is integer-only
+    /// in effect and NaN slips through comparisons.
+    pub sampler_live_share: f64,
     pub read_only: bool,
     pub fetch_workers: usize,
     pub max_connections: usize,
@@ -241,6 +250,7 @@ impl Default for CrawlConfig {
             state_dir: PathBuf::from("/var/lib/dhtcrawler4"),
             max_packets_per_sec: dc4_dht::DEFAULT_MAX_PACKETS_PER_SEC,
             sampler_concurrency: dc4_dht::DEFAULT_SAMPLER_CONCURRENCY,
+            sampler_live_share: 0.10,
             read_only: false,
             fetch_workers: 3072,
             max_connections: 12288,
@@ -494,6 +504,7 @@ fn line_and_column(text: &str, at: usize) -> (usize, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueKind {
     Integer,
+    Float,
     Boolean,
     String,
     StringList,
@@ -574,6 +585,7 @@ fn template_kind(template: &toml::Table, path: &[String]) -> Result<ValueKind, S
     match table.get(key.as_str()) {
         None => Err(format!("unknown key `{dotted}`")),
         Some(toml::Value::Integer(_)) => Ok(ValueKind::Integer),
+        Some(toml::Value::Float(_)) => Ok(ValueKind::Float),
         Some(toml::Value::Boolean(_)) => Ok(ValueKind::Boolean),
         Some(toml::Value::String(_)) => Ok(ValueKind::String),
         Some(toml::Value::Array(items)) => match items.first() {
@@ -600,6 +612,11 @@ fn parse_env_value(kind: ValueKind, raw: &str) -> Result<toml::Value, String> {
     };
     match kind {
         ValueKind::Integer => integer(raw),
+        ValueKind::Float => raw
+            .trim()
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .map_err(|_| "expected a number".to_owned()),
         ValueKind::Boolean => match raw.trim().to_ascii_lowercase().as_str() {
             "true" => Ok(toml::Value::Boolean(true)),
             "false" => Ok(toml::Value::Boolean(false)),
@@ -769,6 +786,13 @@ impl Config {
             1,
             dc4_dht::MAX_SAMPLER_CONCURRENCY,
         )?;
+        // Manual, not `check_range`: NaN slips through `<`/`>` comparisons;
+        // `contains` fails NaN (mirrors `DhtTuning::validate`).
+        if !(0.0..=1.0).contains(&c.sampler_live_share) {
+            return Err(invalid(
+                "crawl.sampler_live_share must be between 0.0 and 1.0",
+            ));
+        };
         check_range("crawl.fetch_workers", c.fetch_workers, 1, MAX_FETCH_WORKERS)?;
         check_range(
             "crawl.max_connections",
@@ -1225,6 +1249,8 @@ mod tests {
         // also pass if the keys were missing (serde defaults fill them in).
         assert!(EXAMPLE.contains("search_cache_size"));
         assert!(EXAMPLE.contains("search_cache_ttl_secs"));
+        assert!(EXAMPLE.contains("sampler_live_share"));
+        assert!(EXAMPLE.contains("fetch_packets_per_sec"));
         assert_eq!(
             parsed.web.search_cache_size,
             dc4_web::DEFAULT_SEARCH_CACHE_ENTRIES
@@ -1518,6 +1544,9 @@ mod tests {
             ("DC4_CRAWL__BOOTSTRAP", "no-port"),
             ("DC4_CRAWL__SAMPLER_CONCURRENCY", "1025"),
             ("DC4_CRAWL__SAMPLER_CONCURRENCY", "0"),
+            ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "1.5"),
+            ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "-0.1"),
+            ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "NaN"),
             ("DC4_INDEX__BATCH_SIZE", "1001"),
             ("DC4_INDEX__WRITER_HEAP_BYTES", "1000"),
             ("DC4_INDEX__POLL_INTERVAL_MS", "0"),

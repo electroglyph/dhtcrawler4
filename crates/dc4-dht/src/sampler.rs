@@ -395,6 +395,109 @@ impl Frontier {
     }
 }
 
+/// Live addresses known to hold stores, for direct sampling.
+/// Bounded and LRU-ish: full evicts the oldest. Memory ~130KB, negligible.
+pub(crate) const LIVE_RING_CAP: usize = 4096;
+/// Consecutive probe failures (errors or empty answers) that evict an entry.
+const LIVE_MAX_FAILS: u32 = 3;
+
+struct LiveEntry {
+    addr: SocketAddr,
+    fails: u32,
+}
+
+/// Addresses that recently proved live (successful fetches, connected hint
+/// peers, inbound `announce_peer` endpoints). `sample_infohashes` needs no
+/// node ID, so bare addresses are enough to query.
+pub(crate) struct LiveRing {
+    entries: VecDeque<LiveEntry>,
+    index: HashSet<SocketAddr>,
+}
+
+impl LiveRing {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            index: HashSet::new(),
+        }
+    }
+
+    /// Records a sighting of life; resets the fail count. Bounded: the
+    /// oldest entry leaves at capacity.
+    fn offer(&mut self, addr: SocketAddr) {
+        if self.index.contains(&addr) {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.addr == addr) {
+                e.fails = 0;
+            }
+            return;
+        }
+        while self.entries.len() >= LIVE_RING_CAP {
+            if let Some(old) = self.entries.pop_front() {
+                self.index.remove(&old.addr);
+            } else {
+                break;
+            }
+        }
+        self.entries.push_back(LiveEntry { addr, fails: 0 });
+        self.index.insert(addr);
+    }
+
+    /// A random entry of `family`, if any. Empty ring degrades to no probe,
+    /// never panics — important at cold start.
+    fn pick(&self, family: Family) -> Option<SocketAddr> {
+        let mut n = 0usize;
+        let mut chosen: Option<SocketAddr> = None;
+        for e in &self.entries {
+            if Family::of(&e.addr) != family {
+                continue;
+            }
+            n = n.saturating_add(1);
+            // Reservoir sampling: single pass, uniform, no allocation.
+            if rand::random_range(0..n) == 0 {
+                chosen = Some(e.addr);
+            }
+        }
+        chosen
+    }
+
+    /// Records a probe verdict. `Some(true)` resets the fail count;
+    /// `Some(false)` strikes (evicts at [`LIVE_MAX_FAILS`); returns true
+    /// when evicted); `None` leaves the entry alone — filtered, throttled,
+    /// cancelled or busy is no verdict on the address.
+    /// A re-offered address resets via [`LiveRing::offer`].
+    fn note(&mut self, addr: SocketAddr, live: Option<bool>) -> bool {
+        let Some(fails) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.addr == addr)
+            .map(|e| &mut e.fails)
+        else {
+            return false;
+        };
+        match live {
+            Some(true) => {
+                *fails = 0;
+                false
+            }
+            Some(false) => {
+                *fails = fails.saturating_add(1);
+                if *fails >= LIVE_MAX_FAILS {
+                    self.entries.retain(|e| e.addr != addr);
+                    self.index.remove(&addr);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Sampler state shared by the workers of both families.
 pub(crate) struct Sampler {
     /// Samples each source network may still yield.
@@ -405,6 +508,8 @@ pub(crate) struct Sampler {
     v6: Mutex<Frontier>,
     refilling_v4: AtomicBool,
     refilling_v6: AtomicBool,
+    /// Live addresses for direct probing.
+    live: Mutex<LiveRing>,
 }
 
 impl Sampler {
@@ -420,6 +525,7 @@ impl Sampler {
             v6: Mutex::new(Frontier::new(now)),
             refilling_v4: AtomicBool::new(false),
             refilling_v6: AtomicBool::new(false),
+            live: Mutex::new(LiveRing::new()),
         }
     }
 
@@ -461,6 +567,12 @@ impl Sampler {
         nodes.iter().filter(|n| frontier.offer(**n, now)).count()
     }
 
+    /// Offers a live address for direct probing. Bare
+    /// addresses only — `sample_infohashes` needs no node ID.
+    pub(crate) fn offer_live(&self, addr: SocketAddr) {
+        lock(&self.live).offer(addr);
+    }
+
     /// Takes up to [`MAX_SAMPLES_PER_REPLY`] of `samples` answered by `node`
     /// as `answered_as`, within the quota of the node's network.
     pub(crate) fn accept_samples(
@@ -490,6 +602,50 @@ impl Sampler {
     pub(crate) fn sizes(&self, family: Family) -> (usize, usize) {
         let frontier = lock(self.frontier(family));
         (frontier.len(), frontier.visited_len())
+    }
+
+    /// Ingests an Ok `sample_infohashes` response: clears the timeout
+    /// strike, honours the interval skip, takes quota-bounded samples and
+    /// emits them as `Source::Sample`. Shared by the frontier path and the
+    /// live-probe path so probes flow through the normal
+    /// admission path with no admission changes. Returns the resample
+    /// decision plus the accepted sample count (0 = empty answer).
+    fn ingest_ok(
+        &self,
+        inner: &Inner,
+        sock: &SocketNode,
+        node: &CompactNode,
+        response: &Response,
+    ) -> (Option<NodeId>, Duration, usize) {
+        let tuning = &inner.cfg.tuning;
+        self.clear_timeout_strike(node.addr);
+        let (answered_as, skip) = sample_skip(&node.id, response, tuning);
+        let mut count = 0usize;
+        if answered_as.is_some()
+            && let Some(samples) = response.samples.clone()
+        {
+            let samples = self.accept_samples(
+                inner.policy,
+                node,
+                &response.id,
+                samples,
+                Instant::now(),
+            );
+            count = samples.len();
+            let total = u64::try_from(count).unwrap_or(u64::MAX);
+            add(&inner.counters.family(sock.family).samples, total);
+            let from = canonical_ip(node.addr.ip());
+            for key in samples {
+                inner.emit(Discovered {
+                    key,
+                    source: Source::Sample,
+                    peer: None,
+                    seed: false,
+                    from,
+                });
+            }
+        }
+        (answered_as, skip, count)
     }
 }
 
@@ -531,6 +687,20 @@ pub(crate) async fn worker(inner: Arc<Inner>, index: usize) {
     };
     let idle = inner.cfg.tuning.sampler_idle_wait;
     while !inner.cancel.is_cancelled() {
+        // a fraction of picks probe a random live address
+        // instead of traversing the frontier. Empty ring degrades to the
+        // frontier below, never panics — important at cold start. (The
+        // pick is bound before the branch so no lock guard is held
+        // across the probe's await.)
+        let live_addr = if live_probe_due(&inner.cfg.tuning) {
+            lock(&sampler.live).pick(sock.family)
+        } else {
+            None
+        };
+        if let Some(addr) = live_addr {
+            sample_live(&inner, sampler, &sock, addr).await;
+            continue;
+        }
         let (pick, refused) = lock(sampler.frontier(sock.family)).pick(Instant::now());
         add(&inner.counters.sampler_visited_full, refused);
         let keep_going = match pick {
@@ -586,31 +756,7 @@ async fn sample_one(inner: &Inner, sampler: &Sampler, sock: &SocketNode, ticket:
         .await;
     let (answered_as, skip) = match result {
         Ok(response) => {
-            sampler.clear_timeout_strike(node.addr);
-            let (answered_as, skip) = sample_skip(&node.id, &response, tuning);
-            if answered_as.is_some()
-                && let Some(samples) = response.samples
-            {
-                let samples = sampler.accept_samples(
-                    inner.policy,
-                    &node,
-                    &response.id,
-                    samples,
-                    Instant::now(),
-                );
-                let count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
-                add(&inner.counters.family(sock.family).samples, count);
-                let from = canonical_ip(node.addr.ip());
-                for key in samples {
-                    inner.emit(Discovered {
-                        key,
-                        source: Source::Sample,
-                        peer: None,
-                        seed: false,
-                        from,
-                    });
-                }
-            }
+            let (answered_as, skip, _) = sampler.ingest_ok(inner, sock, &node, &response);
             (answered_as, skip)
         }
         Err(QueryError::Timeout) => {
@@ -634,6 +780,56 @@ async fn sample_one(inner: &Inner, sampler: &Sampler, sock: &SocketNode, ticket:
         }
     };
     guard.finish(answered_as, after_skip(Instant::now(), skip));
+}
+
+/// One direct probe of a live address: the same
+/// `sample_infohashes` query the frontier path sends, travelling the normal
+/// `query()` path so `may_contact` filtering, per-addr spacing and budgets
+/// apply unchanged (a reallocation inside existing budgets, no new abuse
+/// surface). No ticket, no frontier finish; the responder is attributed by
+/// whatever ID answers (`expect: None`).
+async fn sample_live(inner: &Inner, sampler: &Sampler, sock: &SocketNode, addr: SocketAddr) {
+    let tuning = &inner.cfg.tuning;
+    let method = Method::SampleInfohashes {
+        target: NodeId::random(),
+    };
+    let result = inner
+        .query_gated_with_timeout(
+            sock,
+            addr,
+            method,
+            None,
+            &|_| true,
+            tuning.sampler_query_timeout,
+        )
+        .await;
+    // Only network verdicts count: timeouts and broken replies strike,
+    // filtered/throttled/cancelled/busy sends leave the entry alone.
+    let verdict = match &result {
+        Ok(response) => {
+            let node = CompactNode {
+                id: response.id,
+                addr,
+            };
+            let (_, _, count) = sampler.ingest_ok(inner, sock, &node, response);
+            Some(count > 0)
+        }
+        Err(QueryError::Timeout | QueryError::Remote(_) | QueryError::Malformed) => {
+            sampler.timeout_strike(addr);
+            Some(false)
+        }
+        Err(_) => None,
+    };
+    if lock(&sampler.live).note(addr, verdict) {
+        incr(&inner.counters.sampler_live_evicted);
+    }
+}
+
+/// Whether this pick probes a live address. NaN share is belt-and-braces
+/// false here (validation already rejects it).
+fn live_probe_due(tuning: &DhtTuning) -> bool {
+    let share = tuning.sampler_live_share;
+    share > 0.0 && rand::random::<f64>() < share
 }
 
 /// Backoff and visited identity for a sample response, without touching
@@ -1257,5 +1453,62 @@ mod tests {
             "the visited map filled up; the model is no longer exact"
         );
         eprintln!("sent {sent}, refused {refused}");
+    }
+
+    #[test]
+    fn live_ring_offers_picks_and_evicts() {
+        use std::net::SocketAddr;
+
+        let mut ring = LiveRing::new();
+        assert_eq!(ring.pick(Family::V4), None, "empty ring never panics");
+        let a: SocketAddr = "1.1.1.1:6881".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:6881".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        ring.offer(a);
+        ring.offer(b);
+        ring.offer(v6);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.pick(Family::V6), Some(v6), "family-filtered");
+        for _ in 0..50 {
+            let p = ring.pick(Family::V4).unwrap();
+            assert!(p == a || p == b, "uniform over v4 entries");
+        }
+        // Re-offer resets the fail count.
+        ring.note(a, Some(false));
+        ring.note(a, Some(false));
+        ring.offer(a);
+        ring.note(a, Some(false));
+        ring.note(a, Some(false));
+        assert_eq!(ring.len(), 3, "reset strikes survive");
+        ring.note(a, Some(false));
+        assert_eq!(ring.len(), 2, "three consecutive strikes evict");
+        // Non-verdicts leave the entry alone.
+        ring.note(b, None);
+        ring.note(b, None);
+        assert_eq!(ring.len(), 2);
+        // Success resets.
+        ring.note(b, Some(false));
+        ring.note(b, Some(true));
+        ring.note(b, Some(false));
+        ring.note(b, Some(false));
+        assert_eq!(ring.len(), 2);
+        // Unknown addresses are a no-op.
+        assert!(!ring.note("3.3.3.3:6881".parse().unwrap(), Some(false)));
+        // Bounded: oldest leaves at capacity.
+        for i in 0..LIVE_RING_CAP + 10 {
+            ring.offer(SocketAddr::from(([10, 0, 0, 1], 1024 + i as u16)));
+        }
+        assert_eq!(ring.len(), LIVE_RING_CAP);
+    }
+
+    #[test]
+    fn live_probe_due_respects_share() {
+        let mut tuning = DhtTuning::default();
+        tuning.sampler_live_share = 0.0;
+        assert!(!live_probe_due(&tuning));
+        tuning.sampler_live_share = f64::NAN;
+        assert!(!live_probe_due(&tuning), "NaN never probes");
+        tuning.sampler_live_share = 1.0;
+        assert!(live_probe_due(&tuning));
     }
 }

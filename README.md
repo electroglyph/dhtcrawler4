@@ -774,7 +774,7 @@ How to read the output:
   `dc4_dht_queries_received_total` climbing (especially `get_peers`) proves
   inbound UDP 6881 works — near zero means the internet cannot reach
   the node: fix the firewall/security group, no config knob compensates.
-  All-zero `v6` lines just mean no working IPv6 (harmless).
+  All-zero `v6` lines just mean no working IPv6 (harmless). 10% of sampler picks probe known-live addresses directly (`sampler_live_share`, kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`); `dc4_dht_sampler_live_evicted_total` climbing fast means the ring is full of dead addrs.
 - **Is the queue moving?** `dc4_claim_chan_depth` fluctuating under 256
   is healthy backpressure; pinned at 256 with `dc4_fetch_total` frozen means
   the workers are stuck, not the claimer. `dc4_claimed_total{live="true"}`
