@@ -111,16 +111,21 @@ impl Default for ScrapeTuning {
 pub enum ScrapeVerdict {
     /// An aware estimate above the threshold; carries the estimate.
     Live { est: u32 },
-    /// An aware estimate at or below the threshold over both families;
-    /// carries the estimate.
+    /// An aware estimate at or below the threshold over every available
+    /// family; carries the estimate.
     Dead { est: u32 },
-    /// No aware responses, a saturated union, or a single-family zero:
-    /// keep the old estimate, change nothing.
+    /// No aware responses, a saturated union, or a single-family zero while
+    /// the other family is still available: keep the old estimate, change
+    /// nothing.
     Unknown,
 }
 
-/// Classifies `report` against `threshold` (bep33.md §4 step 3).
-pub fn classify(report: &ScrapeReport, threshold: u64) -> ScrapeVerdict {
+/// Classifies `report` against `threshold`. Death needs every available
+/// family attempted: `families_attempted >= 2` on dual-stack, or a single
+/// family when `v6_available` is false (no v6 sockets, so the v6 pass could
+/// never run). A deadline-skipped v6 pass on a v6-capable host stays
+/// unknown, never dead.
+pub fn classify(report: &ScrapeReport, threshold: u64, v6_available: bool) -> ScrapeVerdict {
     let Some(est) = report.seeders_est() else {
         return ScrapeVerdict::Unknown;
     };
@@ -129,7 +134,7 @@ pub fn classify(report: &ScrapeReport, threshold: u64) -> ScrapeVerdict {
             est: u32::try_from(est).unwrap_or(u32::MAX),
         };
     }
-    if report.families_attempted >= 2 {
+    if report.families_attempted >= 2 || (!v6_available && report.families_attempted >= 1) {
         return ScrapeVerdict::Dead {
             est: u32::try_from(est).unwrap_or(u32::MAX),
         };
@@ -319,7 +324,7 @@ impl<S: CrawlStore> Scraper<S> {
             .await;
         metrics::histogram!(crate::peers::METRIC_LOOKUP_DURATION, "kind" => "scrape")
             .record(start.elapsed());
-        let verdict = classify(&report, self.tuning.threshold);
+        let verdict = classify(&report, self.tuning.threshold, self.dht.has_v6());
         Some((item.clone(), verdict))
     }
 
@@ -414,7 +419,7 @@ mod tests {
     fn classify_maps_reports_to_verdicts() {
         // Live: aware estimate above the threshold.
         assert_eq!(
-            classify(&live_report(&["9.9.9.9"]), 0),
+            classify(&live_report(&["9.9.9.9"]), 0, true),
             ScrapeVerdict::Live { est: 1 }
         );
         // Dead: aware estimate at or below the threshold over both families.
@@ -422,25 +427,36 @@ mod tests {
         dead.aware = 2;
         dead.seed_filters = vec![[0u8; dc4_dht::bloom::BLOOM_LEN]; 2];
         dead.peer_filters = vec![[0u8; dc4_dht::bloom::BLOOM_LEN]; 2];
-        assert_eq!(classify(&dead, 0), ScrapeVerdict::Dead { est: 0 });
-        // The same zero over one family is unknown, never dead.
+        assert_eq!(classify(&dead, 0, true), ScrapeVerdict::Dead { est: 0 });
+        // The same zero over one family is unknown while v6 is available
+        // (the v6 pass might be live), but dead when it is not (no v6
+        // sockets, so the v6 pass could never run).
         let mut single = dead.clone();
         single.families_attempted = 1;
-        assert_eq!(classify(&single, 0), ScrapeVerdict::Unknown);
-        // No aware responses: unknown.
-        assert_eq!(classify(&empty_report(0, 2), 0), ScrapeVerdict::Unknown);
-        // Zero families attempted with zero filters: unknown.
-        assert_eq!(classify(&empty_report(0, 0), 0), ScrapeVerdict::Unknown);
+        assert_eq!(classify(&single, 0, true), ScrapeVerdict::Unknown);
+        assert_eq!(
+            classify(&single, 0, false),
+            ScrapeVerdict::Dead { est: 0 }
+        );
+        // No aware responses: unknown with or without v6 (no estimate).
+        assert_eq!(classify(&empty_report(0, 2), 0, true), ScrapeVerdict::Unknown);
+        assert_eq!(
+            classify(&empty_report(0, 0), 0, false),
+            ScrapeVerdict::Unknown
+        );
         // Threshold gates on the actual estimate: below is live, equal is dead.
         let r = live_report(&["9.9.9.9", "8.8.8.8"]);
         let est = r.seeders_est().expect("two seeds estimate");
         assert!(est > 0, "{est}");
         let as_u32 = u32::try_from(est).unwrap();
         assert_eq!(
-            classify(&r, est.saturating_sub(1)),
+            classify(&r, est.saturating_sub(1), true),
             ScrapeVerdict::Live { est: as_u32 }
         );
-        assert_eq!(classify(&r, est), ScrapeVerdict::Dead { est: as_u32 });
+        assert_eq!(
+            classify(&r, est, true),
+            ScrapeVerdict::Dead { est: as_u32 }
+        );
     }
 
     #[test]

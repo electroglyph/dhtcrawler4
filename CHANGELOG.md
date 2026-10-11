@@ -2,6 +2,10 @@
 
 Forked from upstream at `3350799` (2026-09-17, merge of Rust rewrite).
 
+## 0.8.1
+
+- Scrape verdicts: a v4-only aware zero estimate now classifies as dead (instead of unknown forever) when the node holds no IPv6 sockets — death needs every available family, not both unconditionally. New `Dht::has_v6()` feeds the classifier per scrape; dual-stack behavior is unchanged. Dead swarms reach the tombstone path via `max_scrape_failures` instead of re-scraping on the unknown interval. No config changes.
+
 ## 0.8.0
 
 - Fetch observability: new `dc4_fetch_stage_seconds{stage}` histogram (`lookup`/`triage`/`dial`/`store`/`total`) decomposing per-key worker occupancy, so throughput work targets the real stage. `store` is one observation per batch; keys dropped by `key_deadline` record nothing (join `total` counts against `dc4_fetch_total` — the gap is the deadline-hit share). No config changes, no behavior change.

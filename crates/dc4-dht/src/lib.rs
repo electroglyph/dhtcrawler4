@@ -222,7 +222,8 @@ pub struct ScrapeReport {
     /// Responses without filter keys.
     pub unaware: usize,
     /// Address families actually scraped (one pass per bound socket).
-    /// A dead verdict is only valid when both families were attempted.
+    /// A dead verdict is only valid when every available family was
+    /// attempted (both on dual-stack; v4 alone when the node has no v6).
     pub families_attempted: usize,
 }
 
@@ -238,7 +239,7 @@ impl ScrapeReport {
     /// True when the report already proves a live swarm: an aware estimate
     /// above `threshold`. Only a live report may skip the second family
     /// (win 3); anything else needs the full traversal, and death always
-    /// needs both families attempted (see the scrape worker).
+    /// needs every available family attempted (see the scrape worker).
     pub fn is_live(&self, threshold: u64) -> bool {
         self.seeders_est().is_some_and(|est| est > threshold)
     }
@@ -428,14 +429,16 @@ impl Dht {
         }
         report
     }
-    /// BEP 33 scrape trying IPv4 first (win 3, bep33.md §12): runs the v4
+    /// BEP 33 scrape trying IPv4 first (win 3): runs the v4
     /// pass and skips the v6 pass only when v4 already proves live
-    /// ([`ScrapeReport::is_live`]). Death always requires both families
-    /// actually attempted in this round — a v4-only zero classifies as
-    /// unknown, never dead, so v6-live swarms are never killed by the
-    /// shortcut. Both passes share one overall `timeout` deadline; a pass
-    /// that cannot start before the deadline is skipped and not counted
-    /// (also unknown, never dead).
+    /// ([`ScrapeReport::is_live`]). Death requires every available family
+    /// actually attempted in this round — on dual-stack a v4-only zero
+    /// classifies as unknown, never dead, so v6-live swarms are never
+    /// killed by the shortcut; with no v6 sockets the v6 loops merge
+    /// nothing and the caller ([`has_v6`](Dht::has_v6)) decides whether a
+    /// v4-only zero is conclusive. Both passes share one overall `timeout`
+    /// deadline; a pass that cannot start before the deadline is skipped
+    /// and not counted (also unknown, never dead).
     pub async fn scrape_v4_first(
         &self,
         key: DhtKey,
@@ -504,6 +507,14 @@ impl Dht {
     /// The bound socket addresses (with the actual ports).
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
         self.inner.sockets.iter().map(|s| s.local_addr).collect()
+    }
+
+    /// Whether the node holds any IPv6 socket. False when IPv6 is disabled
+    /// or the host has no global IPv6 address (IPv4-only): the v6 passes
+    /// then merge nothing, so a v4-only zero estimate is conclusive and
+    /// callers must not require both families for a death verdict.
+    pub fn has_v6(&self) -> bool {
+        self.inner.sockets.iter().any(|s| s.family == Family::V6)
     }
 
     /// Our own IPs: the bound addresses that are not unspecified, plus the
