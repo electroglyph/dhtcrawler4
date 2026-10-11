@@ -53,23 +53,40 @@ pub enum DropReason {
     Unsolicited,
     /// Inbound: from an address that fails the address chokepoint.
     Filtered,
-    /// Outbound: a query not sent because the send budget or the per-IP
-    /// spacing did not allow it in time.
-    Throttled,
+    /// Outbound: a query not sent because the per-IP spacing did not
+    /// allow it in time (split from the old single
+    /// `throttled` label so budget pressure is answerable from metrics).
+    ThrottledSpacing,
+    /// Outbound: a query not sent because the main send budget did not
+    /// allow it in time.
+    ThrottledBudgetMain,
+    /// Outbound: a query not sent because the scrape budget did not allow
+    /// it in time.
+    ThrottledBudgetScrape,
+    /// Outbound: a query not sent because the fetch budget did not allow
+    /// it in time.
+    ThrottledBudgetFetch,
+    /// Outbound: a query not sent because the transaction table was full
+    /// (reports `QueryError::Busy`).
+    ThrottledTxnFull,
     /// Outbound: the datagram could not be encoded or the socket refused it.
     SendError,
 }
 
 impl DropReason {
     /// Every reason, in a fixed order.
-    pub const ALL: [DropReason; 8] = [
+    pub const ALL: [DropReason; 12] = [
         DropReason::RateLimited,
         DropReason::Oversized,
         DropReason::Malformed,
         DropReason::ResponderBudget,
         DropReason::Unsolicited,
         DropReason::Filtered,
-        DropReason::Throttled,
+        DropReason::ThrottledSpacing,
+        DropReason::ThrottledBudgetMain,
+        DropReason::ThrottledBudgetScrape,
+        DropReason::ThrottledBudgetFetch,
+        DropReason::ThrottledTxnFull,
         DropReason::SendError,
     ];
 
@@ -82,7 +99,11 @@ impl DropReason {
             DropReason::ResponderBudget => "responder_budget",
             DropReason::Unsolicited => "unsolicited",
             DropReason::Filtered => "filtered",
-            DropReason::Throttled => "throttled",
+            DropReason::ThrottledSpacing => "throttled_spacing",
+            DropReason::ThrottledBudgetMain => "throttled_budget_main",
+            DropReason::ThrottledBudgetScrape => "throttled_budget_scrape",
+            DropReason::ThrottledBudgetFetch => "throttled_budget_fetch",
+            DropReason::ThrottledTxnFull => "throttled_txn_full",
             DropReason::SendError => "send_error",
         }
     }
@@ -97,7 +118,11 @@ pub struct DropCounts {
     pub responder_budget: u64,
     pub unsolicited: u64,
     pub filtered: u64,
-    pub throttled: u64,
+    pub throttled_spacing: u64,
+    pub throttled_budget_main: u64,
+    pub throttled_budget_scrape: u64,
+    pub throttled_budget_fetch: u64,
+    pub throttled_txn_full: u64,
     pub send_error: u64,
 }
 
@@ -111,7 +136,11 @@ impl DropCounts {
             DropReason::ResponderBudget => self.responder_budget,
             DropReason::Unsolicited => self.unsolicited,
             DropReason::Filtered => self.filtered,
-            DropReason::Throttled => self.throttled,
+            DropReason::ThrottledSpacing => self.throttled_spacing,
+            DropReason::ThrottledBudgetMain => self.throttled_budget_main,
+            DropReason::ThrottledBudgetScrape => self.throttled_budget_scrape,
+            DropReason::ThrottledBudgetFetch => self.throttled_budget_fetch,
+            DropReason::ThrottledTxnFull => self.throttled_txn_full,
             DropReason::SendError => self.send_error,
         }
     }
@@ -291,7 +320,11 @@ struct DropCounters {
     responder_budget: AtomicU64,
     unsolicited: AtomicU64,
     filtered: AtomicU64,
-    throttled: AtomicU64,
+    throttled_spacing: AtomicU64,
+    throttled_budget_main: AtomicU64,
+    throttled_budget_scrape: AtomicU64,
+    throttled_budget_fetch: AtomicU64,
+    throttled_txn_full: AtomicU64,
     send_error: AtomicU64,
 }
 
@@ -304,7 +337,11 @@ impl DropCounters {
             DropReason::ResponderBudget => &self.responder_budget,
             DropReason::Unsolicited => &self.unsolicited,
             DropReason::Filtered => &self.filtered,
-            DropReason::Throttled => &self.throttled,
+            DropReason::ThrottledSpacing => &self.throttled_spacing,
+            DropReason::ThrottledBudgetMain => &self.throttled_budget_main,
+            DropReason::ThrottledBudgetScrape => &self.throttled_budget_scrape,
+            DropReason::ThrottledBudgetFetch => &self.throttled_budget_fetch,
+            DropReason::ThrottledTxnFull => &self.throttled_txn_full,
             DropReason::SendError => &self.send_error,
         }
     }
@@ -318,7 +355,11 @@ impl DropCounters {
             responder_budget: g(DropReason::ResponderBudget),
             unsolicited: g(DropReason::Unsolicited),
             filtered: g(DropReason::Filtered),
-            throttled: g(DropReason::Throttled),
+            throttled_spacing: g(DropReason::ThrottledSpacing),
+            throttled_budget_main: g(DropReason::ThrottledBudgetMain),
+            throttled_budget_scrape: g(DropReason::ThrottledBudgetScrape),
+            throttled_budget_fetch: g(DropReason::ThrottledBudgetFetch),
+            throttled_txn_full: g(DropReason::ThrottledTxnFull),
             send_error: g(DropReason::SendError),
         }
     }

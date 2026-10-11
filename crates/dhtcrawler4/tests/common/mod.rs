@@ -75,6 +75,7 @@ pub fn node_config(bootstrap: &[SocketAddr], sampler: bool) -> DhtConfig {
         state_file: None,
         max_packets_per_sec: 2000,
         scrape_packets_per_sec: 2000,
+        fetch_packets_per_sec: 2000,
         sampler,
         sampler_concurrency: 8,
         read_only: false,

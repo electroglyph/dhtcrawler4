@@ -55,10 +55,10 @@ use tokio_util::sync::DropGuard;
 
 pub use compact::{Family, is_dialable};
 pub use config::{
-    DEFAULT_BOOTSTRAP, DEFAULT_CLIENT_VERSION, DEFAULT_MAX_PACKETS_PER_SEC, DEFAULT_PORT,
-    DEFAULT_RESPONDER_BYTES_PER_SEC, DEFAULT_RESPONDER_REPLIES_PER_SEC,
-    DEFAULT_SAMPLER_CONCURRENCY, DEFAULT_SCRAPE_PACKETS_PER_SEC, DhtConfig, DhtTuning,
-    MAX_SAMPLER_CONCURRENCY,
+    DEFAULT_BOOTSTRAP, DEFAULT_CLIENT_VERSION, DEFAULT_FETCH_PACKETS_PER_SEC,
+    DEFAULT_MAX_PACKETS_PER_SEC, DEFAULT_PORT, DEFAULT_RESPONDER_BYTES_PER_SEC,
+    DEFAULT_RESPONDER_REPLIES_PER_SEC, DEFAULT_SAMPLER_CONCURRENCY,
+    DEFAULT_SCRAPE_PACKETS_PER_SEC, DhtConfig, DhtTuning, MAX_SAMPLER_CONCURRENCY,
 };
 pub use node::MIN_GOOD_NODES;
 pub use node_id::NodeId;
@@ -266,6 +266,24 @@ impl Dht {
         report
     }
 
+    /// Fetch traversal for `key` on every address family:
+    /// like [`scrape`](Dht::scrape) — iterative `get_peers` with `scrape=1`
+    /// and the same filter union — but on the dedicated fetch budget instead
+    /// of the scrape budget. The scrape role keeps `scrape` (now
+    /// uncontended); the fetch role uses this.
+    pub async fn scrape_fetch(&self, key: DhtKey, timeout: Duration) -> ScrapeReport {
+        let deadline = after(Instant::now(), timeout);
+        let lookups = self
+            .inner
+            .sockets
+            .iter()
+            .map(|sock| lookup::scrape_fetch(&self.inner, sock, key, deadline));
+        let mut report = ScrapeReport::default();
+        for outcome in join_all(lookups).await {
+            report.merge_outcome(outcome);
+        }
+        report
+    }
     /// BEP 33 scrape trying IPv4 first (win 3, bep33.md §12): runs the v4
     /// pass and skips the v6 pass only when v4 already proves live
     /// ([`ScrapeReport::is_live`]). Death always requires both families

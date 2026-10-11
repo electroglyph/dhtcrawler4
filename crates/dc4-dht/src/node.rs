@@ -143,6 +143,10 @@ pub(crate) struct Inner {
     /// bucket and crawl bursts never starve scrapes. Per-address spacing
     /// stays shared (one query per second per host across both kinds).
     scrape_budget: Mutex<TokenBucket>,
+    /// The dedicated fetch budget: fetch traversals never
+    /// starve scrapes and scrape bursts never starve fetches. Spacing stays
+    /// shared like above.
+    fetch_budget: Mutex<TokenBucket>,
     /// Closest-node lists of recent scrapes, reused as the start set of
     /// repeat scrapes (bep33.md §2/§12 win 2). `None` disables the cache
     /// (`scrape_node_cache_keys == 0`).
@@ -347,6 +351,8 @@ impl Inner {
         let budget = TokenBucket::new(cfg.max_packets_per_sec, cfg.max_packets_per_sec, now);
         let scrape_budget =
             TokenBucket::new(cfg.scrape_packets_per_sec, cfg.scrape_packets_per_sec, now);
+        let fetch_budget =
+            TokenBucket::new(cfg.fetch_packets_per_sec, cfg.fetch_packets_per_sec, now);
         let responder_budget = ResponderBudget::new(
             tuning.responder_replies_per_sec,
             tuning.responder_bytes_per_sec,
@@ -362,6 +368,7 @@ impl Inner {
             own: Mutex::new(own),
             budget: Mutex::new(budget),
             scrape_budget: Mutex::new(scrape_budget),
+            fetch_budget: Mutex::new(fetch_budget),
             scrape_nodes,
             responder_budget: Mutex::new(responder_budget),
             counters: Counters::default(),
@@ -541,6 +548,28 @@ impl Inner {
         }
     }
 
+    async fn acquire_fetch_budget(&self, max_wait: Duration) -> bool {
+        let give_up = after(Instant::now(), max_wait);
+        loop {
+            let now = Instant::now();
+            let wait = {
+                let mut budget = lock(&self.fetch_budget);
+                if budget.try_acquire(now) {
+                    return true;
+                }
+                budget.wait_time(now)
+            };
+            let wake = after_skip(now, wait.max(MIN_BUDGET_WAIT));
+            if wake > give_up {
+                return false;
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(wake) => {}
+                () = self.cancel.cancelled() => return false,
+            }
+        }
+    }
+
     /// Sends one query and waits for its reply. Timeouts count as failures
     /// in the routing table; replies are processed by the receive loop.
     pub(crate) async fn query(
@@ -600,7 +629,7 @@ impl Inner {
                 .spacing
                 .reserve(&addr, Instant::now(), tuning.max_send_wait);
         let Some(wait) = spacing else {
-            counters.drop_packet(DropReason::Throttled);
+            counters.drop_packet(DropReason::ThrottledSpacing);
             return Err(QueryError::Throttled);
         };
         let waited_from = Instant::now();
@@ -616,7 +645,7 @@ impl Inner {
             if self.cancel.is_cancelled() {
                 return Err(QueryError::Cancelled);
             }
-            counters.drop_packet(DropReason::Throttled);
+            counters.drop_packet(DropReason::ThrottledBudgetMain);
             return Err(QueryError::Throttled);
         }
         let now = Instant::now();
@@ -644,7 +673,7 @@ impl Inner {
                 drop(st);
                 lock(&self.budget).refund(1);
                 lock(&self.shared).spacing.release(&addr, Instant::now());
-                counters.drop_packet(DropReason::Throttled);
+                counters.drop_packet(DropReason::ThrottledTxnFull);
                 return Err(QueryError::Busy);
             };
             // Drop the lock before encoding: bencode + trim never touch
@@ -731,7 +760,7 @@ impl Inner {
                 .spacing
                 .reserve(&addr, Instant::now(), tuning.max_send_wait);
         let Some(wait) = spacing else {
-            counters.drop_packet(DropReason::Throttled);
+            counters.drop_packet(DropReason::ThrottledSpacing);
             return Err(QueryError::Throttled);
         };
         let waited_from = Instant::now();
@@ -747,7 +776,7 @@ impl Inner {
             if self.cancel.is_cancelled() {
                 return Err(QueryError::Cancelled);
             }
-            counters.drop_packet(DropReason::Throttled);
+            counters.drop_packet(DropReason::ThrottledBudgetScrape);
             return Err(QueryError::Throttled);
         }
         let now = Instant::now();
@@ -769,7 +798,7 @@ impl Inner {
                 drop(st);
                 lock(&self.scrape_budget).refund(1);
                 lock(&self.shared).spacing.release(&addr, Instant::now());
-                counters.drop_packet(DropReason::Throttled);
+                counters.drop_packet(DropReason::ThrottledTxnFull);
                 return Err(QueryError::Busy);
             };
             (id, tid)
@@ -798,6 +827,129 @@ impl Inner {
         if sock.socket.send_to(&packet, addr).await.is_err() {
             lock(&sock.state).txns.remove(tid, &addr);
             lock(&self.scrape_budget).refund(1);
+            lock(&self.shared).spacing.release(&addr, Instant::now());
+            counters.drop_packet(DropReason::SendError);
+            return Err(QueryError::Send);
+        }
+        incr(&counters.packets_out);
+        self.counters.queries_sent.count(&method);
+
+        let reply = tokio::select! {
+            r = tokio::time::timeout_at(deadline, rx) => r,
+            () = self.cancel.cancelled() => {
+                lock(&sock.state).txns.remove(tid, &addr);
+                return Err(QueryError::Cancelled);
+            }
+        };
+        match reply {
+            Ok(Ok(Reply::Response(r))) => Ok(r),
+            Ok(Ok(Reply::Error(e))) => Err(QueryError::Remote(e)),
+            Ok(Ok(Reply::Malformed)) => Err(QueryError::Malformed),
+            Ok(Err(_)) | Err(_) => {
+                {
+                    let mut st = lock(&sock.state);
+                    st.txns.remove(tid, &addr);
+                    st.table.on_failure(&addr, Instant::now());
+                }
+                incr(&self.counters.timeouts);
+                Err(QueryError::Timeout)
+            }
+        }
+    }
+
+    /// [`query`](Self::query) for fetch traversals: identical
+    /// to [`query_scrape`](Self::query_scrape) — same per-address spacing,
+    /// same lenient scrape per-RPC timeout — but charging the dedicated
+    /// fetch bucket instead of the scrape bucket.
+    /// Lock order stays `spacing → budget`, as in [`query_gated`](Self::query_gated).
+    pub(crate) async fn query_fetch(
+        &self,
+        sock: &SocketNode,
+        addr: SocketAddr,
+        method: Method,
+        expect: Option<NodeId>,
+    ) -> Result<Response, QueryError> {
+        let addr = normalize_addr(addr);
+        let tuning = &self.cfg.tuning;
+        let counters = self.counters.family(sock.family);
+        if !self.may_contact(sock.family, &addr) {
+            return Err(QueryError::Filtered);
+        }
+        if self.cancel.is_cancelled() {
+            return Err(QueryError::Cancelled);
+        }
+        let spacing =
+            lock(&self.shared)
+                .spacing
+                .reserve(&addr, Instant::now(), tuning.max_send_wait);
+        let Some(wait) = spacing else {
+            counters.drop_packet(DropReason::ThrottledSpacing);
+            return Err(QueryError::Throttled);
+        };
+        let waited_from = Instant::now();
+        if !wait.is_zero() && !self.sleep(wait).await {
+            lock(&self.shared).spacing.release(&addr, Instant::now());
+            return Err(QueryError::Cancelled);
+        }
+        // Spacing and the send budget share one `max_send_wait`: the budget
+        // wait only gets the remainder instead of a second full bound.
+        let remaining = remaining_budget(tuning.max_send_wait, waited_from.elapsed());
+        if !self.acquire_fetch_budget(remaining).await {
+            lock(&self.shared).spacing.release(&addr, Instant::now());
+            if self.cancel.is_cancelled() {
+                return Err(QueryError::Cancelled);
+            }
+            counters.drop_packet(DropReason::ThrottledBudgetFetch);
+            return Err(QueryError::Throttled);
+        }
+        let now = Instant::now();
+        let (tx, rx) = oneshot::channel();
+        let deadline = after(now, tuning.scrape_query_timeout);
+        let want = self.want_for(&method);
+        let (id, tid) = {
+            let mut st = lock(&sock.state);
+            let id = st.id;
+            let Some(tid) = st.txns.insert(
+                addr,
+                Pending {
+                    tx,
+                    deadline,
+                    expect,
+                },
+                now,
+            ) else {
+                drop(st);
+                lock(&self.fetch_budget).refund(1);
+                lock(&self.shared).spacing.release(&addr, Instant::now());
+                counters.drop_packet(DropReason::ThrottledTxnFull);
+                return Err(QueryError::Busy);
+            };
+            (id, tid)
+        };
+        let msg = Message {
+            tid: tid.to_vec(),
+            version: Some(self.cfg.client_version.to_vec()),
+            ip: None,
+            read_only: self.cfg.read_only,
+            body: Body::Query(Query {
+                id,
+                want,
+                method: method.clone(),
+            }),
+        };
+        let packet = match krpc::encode(&msg) {
+            Ok(packet) => packet,
+            Err(_) => {
+                lock(&sock.state).txns.remove(tid, &addr);
+                lock(&self.fetch_budget).refund(1);
+                lock(&self.shared).spacing.release(&addr, Instant::now());
+                counters.drop_packet(DropReason::SendError);
+                return Err(QueryError::Send);
+            }
+        };
+        if sock.socket.send_to(&packet, addr).await.is_err() {
+            lock(&sock.state).txns.remove(tid, &addr);
+            lock(&self.fetch_budget).refund(1);
             lock(&self.shared).spacing.release(&addr, Instant::now());
             counters.drop_packet(DropReason::SendError);
             return Err(QueryError::Send);

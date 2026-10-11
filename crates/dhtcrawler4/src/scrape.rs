@@ -308,6 +308,7 @@ impl<S: CrawlStore> Scraper<S> {
     /// dilute the shares). The lookup tries IPv4 first and skips IPv6 only
     /// on proven-live (win 3); death always needs both families.
     async fn scrape_one(&self, item: &ScrapeItem) -> Option<(ScrapeItem, ScrapeVerdict)> {
+        let start = std::time::Instant::now();
         let report = self
             .dht
             .scrape_v4_first(
@@ -316,6 +317,8 @@ impl<S: CrawlStore> Scraper<S> {
                 self.tuning.threshold,
             )
             .await;
+        metrics::histogram!(crate::peers::METRIC_LOOKUP_DURATION, "kind" => "scrape")
+            .record(start.elapsed());
         let verdict = classify(&report, self.tuning.threshold);
         Some((item.clone(), verdict))
     }

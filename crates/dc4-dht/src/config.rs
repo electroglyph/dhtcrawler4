@@ -28,6 +28,12 @@ pub const DEFAULT_BOOTSTRAP: [&str; 4] = [
 /// Default BEP 33 scrape budget in packets per second, kept much smaller
 /// than the crawl bucket so scrapes never starve discovery.
 pub const DEFAULT_SCRAPE_PACKETS_PER_SEC: u32 = 100;
+/// Default dedicated fetch budget in packets per second:
+/// fetch traversals are multi-packet lookups running at ~2,000+/s measured,
+/// so 6,000 gives ~3x headroom — fetch alone can never be the binding
+/// constraint while staying near the historic total egress envelope
+/// (6k main + 6k fetch + 100 scrape ≈ old 12k default).
+pub const DEFAULT_FETCH_PACKETS_PER_SEC: u32 = 6_000;
 /// Upper bound on `sampler_concurrency`.
 pub const MAX_SAMPLER_CONCURRENCY: usize = 1024;
 /// Default responder budget in replies per second (design §3).
@@ -57,6 +63,9 @@ pub struct DhtConfig {
     /// Dedicated BEP 33 scrape budget in packets per second: scrape
     /// traversals charge this bucket, never the crawl bucket above.
     pub scrape_packets_per_sec: u32,
+    /// Dedicated fetch budget in packets per second: fetch
+    /// `get_peers` traversals charge this bucket, never the scrape bucket.
+    pub fetch_packets_per_sec: u32,
     /// Run the BEP 51 sampler, which emits `Discovered { source: Sample }`.
     pub sampler: bool,
     /// Number of concurrent `sample_infohashes` queries.
@@ -83,6 +92,7 @@ impl Default for DhtConfig {
             state_file: None,
             max_packets_per_sec: DEFAULT_MAX_PACKETS_PER_SEC,
             scrape_packets_per_sec: DEFAULT_SCRAPE_PACKETS_PER_SEC,
+            fetch_packets_per_sec: DEFAULT_FETCH_PACKETS_PER_SEC,
             sampler: true,
             sampler_concurrency: DEFAULT_SAMPLER_CONCURRENCY,
             read_only: false,
@@ -116,6 +126,11 @@ impl DhtConfig {
         if self.scrape_packets_per_sec == 0 {
             return Err(Error::Config(
                 "scrape_packets_per_sec must be at least 1".into(),
+            ));
+        }
+        if self.fetch_packets_per_sec == 0 {
+            return Err(Error::Config(
+                "fetch_packets_per_sec must be at least 1".into(),
             ));
         }
         if self.sampler_concurrency == 0 || self.sampler_concurrency > MAX_SAMPLER_CONCURRENCY {
@@ -414,6 +429,23 @@ mod tests {
         assert!(c.validate().is_ok());
         let bad = DhtConfig {
             scrape_packets_per_sec: 0,
+            ..DhtConfig::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn fetch_budget_is_dedicated() {
+        // fetch traversals run on their own generous bucket, not
+        // the 100/s scrape bucket (node.rs: `query_fetch` charges
+        // `fetch_budget`, `query_scrape` charges `scrape_budget`; both share
+        // per-address spacing).
+        assert_eq!(DEFAULT_FETCH_PACKETS_PER_SEC, 6_000);
+        let c = DhtConfig::default();
+        assert!(c.fetch_packets_per_sec > c.scrape_packets_per_sec);
+        assert!(c.validate().is_ok());
+        let bad = DhtConfig {
+            fetch_packets_per_sec: 0,
             ..DhtConfig::default()
         };
         assert!(bad.validate().is_err());

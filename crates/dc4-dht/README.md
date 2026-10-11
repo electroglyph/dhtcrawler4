@@ -65,7 +65,13 @@ Not implemented:
 - **Budgets.**
   - Outgoing queries: `max_packets_per_sec` in total (default 12000) and at least 1 s
     between queries to one IP. Sampler concurrency defaults to 1024.
-  - A query waits at most 4 s for the budget, then is dropped (`throttled`).
+  - BEP 33 scrapes charge a dedicated 100/s bucket, fetch traversals a
+    dedicated 6000/s bucket (`fetch_packets_per_sec`); neither can starve
+    the other or the crawl bucket.
+  - A query waits at most 4 s for its budget, then is dropped
+    (`throttled_spacing` / `throttled_budget_main` / `throttled_budget_scrape`
+    / `throttled_budget_fetch` / `throttled_txn_full`, split per site in 0.7.0;
+    formerly a single `throttled` label).
   - A lookup sends α = 3 queries at a time and runs at most 8 rounds.
 - **Replies.**
   - Replies have their own budget: 1500 replies/s and 192 000 bytes/s.
@@ -176,7 +182,10 @@ label of the pipeline metrics.
 The drop reasons are:
 - `rate_limited`, `oversized`, `malformed`, `responder_budget`, `unsolicited` and
   `filtered` for inbound packets;
-- `throttled` and `send_error` for outbound packets.
+- `throttled_spacing`, `throttled_budget_main`, `throttled_budget_scrape`,
+  `throttled_budget_fetch`, `throttled_txn_full` and `send_error` for
+  outbound packets (the five `throttled_*` replace the pre-0.7.0 single
+  `throttled` label).
 
 ## Tests
 

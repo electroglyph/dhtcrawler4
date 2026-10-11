@@ -499,7 +499,8 @@ torrents at first. That is normal (next step). Set `DC4_WEB__HSTS: "true"`
 
 Expect the first searchable torrents within minutes and a steadily growing
 index over hours to days. The default crawl budget (`max_packets_per_sec =
-12000`, 3072 fetch workers) is sized for a server; lower it in
+12000`, `fetch_packets_per_sec = 6000` for fetch traversals, 3072 fetch
+workers) is sized for a server; lower it in
 `deploy/config/dhtcrawler4.toml` on a home connection.
 
 ### 8. Day-to-day operation

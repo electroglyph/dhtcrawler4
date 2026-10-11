@@ -13,6 +13,11 @@ use dc4_core::DhtKey;
 use dc4_dht::ScrapeReport;
 use dc4_dht::compact::canonical_addr;
 
+/// Lookup latency in seconds, labeled by traversal kind (`fetch` for the
+/// fetch role, `scrape` for the scrape role; item 6). The gate
+/// is fetch p99 down after the budget split.
+pub const METRIC_LOOKUP_DURATION: &str = "dc4_lookup_duration_seconds";
+
 /// What the crawler needs from a DHT node. Implemented by [`dc4_dht::Dht`];
 /// tests may substitute their own.
 pub trait PeerSource: Clone + Send + Sync + 'static {
@@ -50,7 +55,13 @@ impl PeerSource for dc4_dht::Dht {
         key: DhtKey,
         timeout: Duration,
     ) -> impl Future<Output = ScrapeReport> + Send {
-        dc4_dht::Dht::scrape(self, key, timeout)
+        async move {
+            let start = std::time::Instant::now();
+            let report = dc4_dht::Dht::scrape_fetch(self, key, timeout).await;
+            metrics::histogram!(METRIC_LOOKUP_DURATION, "kind" => "fetch")
+                .record(start.elapsed());
+            report
+        }
     }
 
     fn own_ips(&self) -> Vec<IpAddr> {

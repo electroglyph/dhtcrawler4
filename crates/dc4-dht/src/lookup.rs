@@ -45,6 +45,10 @@ enum Kind {
     /// BEP 33 scrape: a `get_peers` traversal with `scrape=1` that also
     /// collects `BFsd`/`BFpe` filters from aware responses.
     Scrape,
+    /// Fetch traversal: same wire shape as [`Kind::Scrape`]
+    /// (`scrape=1`, filters collected) but charging the dedicated fetch
+    /// budget instead of the scrape budget.
+    FetchPeers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,7 +266,7 @@ impl Lookup {
         };
         cand.state = CandState::Responded;
         cand.token = response.token;
-        if self.kind == Kind::GetPeers || self.kind == Kind::Scrape {
+        if self.kind == Kind::GetPeers || self.kind == Kind::Scrape || self.kind == Kind::FetchPeers {
             for peer in response.values.unwrap_or_default() {
                 if self.peers.len() >= MAX_LOOKUP_PEERS {
                     break;
@@ -280,7 +284,7 @@ impl Lookup {
                 }
             }
         }
-        if self.kind == Kind::Scrape {
+        if self.kind == Kind::Scrape || self.kind == Kind::FetchPeers {
             match (response.bf_sd, response.bf_pe) {
                 (None, None) => {
                     self.unaware = self.unaware.saturating_add(1);
@@ -403,6 +407,18 @@ async fn ask(
                     .await,
             )
         }
+        Kind::FetchPeers => {
+            let method = Method::GetPeers {
+                info_hash: DhtKey::from(target),
+                scrape: true,
+            };
+            (
+                node.addr,
+                inner
+                    .query_fetch(sock, node.addr, method, Some(node.id))
+                    .await,
+            )
+        }
     }
 }
 
@@ -445,7 +461,7 @@ async fn run(
     // responses proves the swarm live, so the traversal may stop and the
     // caller stores the partial-union lower bound. Zeros never stop early:
     // a dead verdict always needs the full traversal (LB-28).
-    let quorum = if kind == Kind::Scrape {
+    let quorum = if kind == Kind::Scrape || kind == Kind::FetchPeers {
         tuning.scrape_early_exit_quorum
     } else {
         0
@@ -546,6 +562,32 @@ pub(crate) async fn scrape(
         sock,
         NodeId::from(key),
         Kind::Scrape,
+        seeds,
+        deadline,
+    )
+    .await;
+    inner.scrape_cache_store(key, &lookup.closest_responded());
+    lookup.scrape_outcome()
+}
+
+/// Iterative fetch traversal for `key`: a `get_peers`
+/// traversal with `scrape=1` on the dedicated fetch budget, seeded from
+/// the node-list cache when warm and writing its closest nodes back after.
+/// The `scrape: true` piggyback is load-bearing: the BEP 33 seed filters
+/// feed the queue's liveness ordering, so fetch must keep collecting them.
+/// Unions and estimation happen in the caller via [`ScrapeOutcome`].
+pub(crate) async fn scrape_fetch(
+    inner: &Inner,
+    sock: &SocketNode,
+    key: DhtKey,
+    deadline: Instant,
+) -> ScrapeOutcome {
+    let seeds = inner.scrape_cache_seeds(&key);
+    let lookup = run(
+        inner,
+        sock,
+        NodeId::from(key),
+        Kind::FetchPeers,
         seeds,
         deadline,
     )
@@ -938,6 +980,39 @@ mod tests {
             unaware: 3,
         };
         assert_eq!(crate::bloom::estimate_or(&empty.seed_filters), None);
+    }
+
+    #[test]
+    fn fetch_peers_preserves_scrape_filters() {
+        // load-bearing invariant: the fetch traversal keeps
+        // `scrape: true` so the BEP 33 seed filters still feed the queue's
+        // liveness ordering. `Kind::FetchPeers` must collect peers,
+        // filters and live proofs exactly like `Kind::Scrape`.
+        use crate::bloom::ScrapeBloom;
+        use std::net::IpAddr;
+
+        let target = NodeId([0; 20]);
+        let mut l = lookup(target, Kind::FetchPeers, OwnAddrs::default());
+        for i in 1..=3u8 {
+            l.add(node(i, NodeId([i; 20])));
+        }
+        let batch = l.pick(ALPHA);
+        let best = l.best_live();
+        let mut sd = ScrapeBloom::empty();
+        sd.insert_ip(&"9.9.9.9".parse::<IpAddr>().unwrap());
+        let mut r = reply(NodeId([1; 20]), vec![]);
+        r.bf_sd = Some(Box::new(sd.0));
+        r.bf_pe = Some(Box::new([0u8; crate::bloom::BLOOM_LEN]));
+        r.values = Some(vec!["1.1.1.1:1".parse().unwrap()]);
+        assert!(!l.complete(batch[0].addr, Ok(r), best));
+        assert!(!l.complete(batch[1].addr, Ok(reply(NodeId([2; 20]), vec![])), best));
+        assert_eq!(l.live_proofs, 1);
+        let out = l.scrape_outcome();
+        assert_eq!(out.peers, vec!["1.1.1.1:1".parse().unwrap()]);
+        assert_eq!(out.aware, 1);
+        assert_eq!(out.unaware, 1);
+        assert_eq!(out.seed_filters.len(), 1);
+        assert_eq!(crate::bloom::estimate_or(&out.seed_filters), Some(1));
     }
 
     #[test]

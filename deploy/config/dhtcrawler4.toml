@@ -82,6 +82,11 @@ scrape_concurrency = 3
 # Dedicated outbound packet budget for scrapes (burst: 1s), kept far below
 # the crawl bucket so scrapes never starve discovery.
 scrape_packets_per_sec = 100
+# Dedicated outbound packet budget for fetch traversals (burst: 1s).
+# Fetch runs ~2,000 lookups/s measured, so 6000 gives ~3x headroom; fetch
+# alone can never be the binding constraint. Total egress ≈ 6k main + 6k
+# fetch + 100 scrape, near the historic 12k envelope.
+fetch_packets_per_sec = 6000
 # Base admission cooldown of a removed key, in days; repeats escalate
 # 7 -> 30 -> 90 days (the cap is not a knob).
 removal_cooldown_days = 7

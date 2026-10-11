@@ -110,6 +110,7 @@ impl CrawlOptions {
             state_file: cfg.dht_state_file(),
             max_packets_per_sec: c.max_packets_per_sec,
             scrape_packets_per_sec: c.scrape_packets_per_sec,
+            fetch_packets_per_sec: c.fetch_packets_per_sec,
             sampler: true,
             sampler_concurrency: c.sampler_concurrency,
             read_only: c.read_only,
@@ -524,6 +525,10 @@ mod tests {
         assert_eq!(o.filter, PeerFilter::PRODUCTION);
         assert_eq!(o.fetch_workers, 3072);
         assert_eq!(o.dht.scrape_packets_per_sec, 100);
+        assert_eq!(
+            o.dht.fetch_packets_per_sec,
+            dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
+        );
         assert_eq!(o.dht.tuning.scrape_early_exit_quorum, 3);
         assert_eq!(o.dht.tuning.scrape_query_timeout, Duration::from_secs(10));
         assert_eq!(o.dht.tuning.scrape_node_cache_keys, 4096);

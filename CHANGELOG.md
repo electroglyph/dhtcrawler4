@@ -2,6 +2,11 @@
 
 Forked from upstream at `3350799` (2026-09-17, merge of Rust rewrite).
 
+## 0.7.0
+
+- Expand: peer-finding workstreams (fetch budget, hints, live sampling, multi-identity, tracker hybrid). See entries below.
+- Fetch budget: fetch traversals moved off the 100/s scrape bucket onto a dedicated `fetch_packets_per_sec` bucket (default 6000, ~3x measured need; `DC4_CRAWL__FETCH_PACKETS_PER_SEC`, validated 1..=u32::MAX). The traversal keeps `scrape=1` so BEP 33 seed filters still feed queue ordering; the scrape role keeps the now-uncontended 100/s. New `dc4_lookup_duration_seconds{kind}` histogram (`fetch`/`scrape`). Metric-label change: the single `throttled` drop reason is split per site (`throttled_spacing`, `throttled_budget_main`, `throttled_budget_scrape`, `throttled_budget_fetch`, `throttled_txn_full`) — update any dashboard/alert matching the old label. Rollback is revert + rebuild (no env value restores the shared budget).
+
 ## 0.6.2
 
 - Crawl (ops): tune discovery for junk-heavy swarms via the untracked compose override — sampler concurrency 1024→256, packet budget 12000→6000/s, purge sweep 3600→600 s, crawl pool 128→32 (PG `max_connections` stays 200). No code or default-config changes; `max_pending` 1M and sample corroboration stay conditional on the next diag.

@@ -200,6 +200,11 @@ pub struct CrawlConfig {
     pub scrape_concurrency: usize,
     /// Dedicated outbound packet budget for scrapes.
     pub scrape_packets_per_sec: u32,
+    /// Dedicated outbound packet budget for fetch traversals:
+    /// fetch runs ~2,000+/s measured, so the 6,000 default gives ~3x
+    /// headroom. Zero cannot restore the old shared-budget behavior
+    /// (`TokenBucket::new` treats 0 as 1); rollback is revert + rebuild.
+    pub fetch_packets_per_sec: u32,
     /// Base admission cooldown of a removed key, in days; repeats escalate
     /// 7 -> 28 -> 90 days (capped, not a knob).
     pub removal_cooldown_days: u64,
@@ -251,6 +256,7 @@ impl Default for CrawlConfig {
             scrape_lookup_timeout_secs: 60,
             scrape_concurrency: 3,
             scrape_packets_per_sec: dc4_dht::DEFAULT_SCRAPE_PACKETS_PER_SEC,
+            fetch_packets_per_sec: dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC,
             removal_cooldown_days: 7,
             tombstone_purge_hours: 1,
             gave_up_purge_hours: 1,
@@ -822,6 +828,12 @@ impl Config {
             c.scrape_packets_per_sec,
             1,
             250,
+        )?;
+        check_range(
+            "crawl.fetch_packets_per_sec",
+            c.fetch_packets_per_sec,
+            1,
+            u32::MAX,
         )?;
         check_range(
             "crawl.removal_cooldown_days",
@@ -1615,6 +1627,10 @@ mod tests {
         assert_eq!(c.scrape_lookup_timeout_secs, 60);
         assert_eq!(c.scrape_concurrency, 3);
         assert_eq!(c.scrape_packets_per_sec, 100);
+        assert_eq!(
+            c.fetch_packets_per_sec,
+            dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
+        );
         assert_eq!(c.removal_cooldown_days, 7);
         assert_eq!(c.tombstone_purge_hours, 1);
         assert_eq!(c.gave_up_purge_hours, 1);
