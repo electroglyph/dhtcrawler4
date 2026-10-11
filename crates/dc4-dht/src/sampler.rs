@@ -396,7 +396,8 @@ impl Frontier {
 }
 
 /// Live addresses known to hold stores, for direct sampling.
-/// Bounded and LRU-ish: full evicts the oldest. Memory ~130KB, negligible.
+/// Bounded and LRU-ish: full evicts the oldest, re-offered addrs refresh
+/// to the back. Memory ~130KB, negligible.
 pub(crate) const LIVE_RING_CAP: usize = 4096;
 /// Consecutive probe failures (errors or empty answers) that evict an entry.
 const LIVE_MAX_FAILS: u32 = 3;
@@ -422,12 +423,15 @@ impl LiveRing {
         }
     }
 
-    /// Records a sighting of life; resets the fail count. Bounded: the
-    /// oldest entry leaves at capacity.
+    /// Records a sighting of life; resets the fail count and refreshes
+    /// recency (moves to the back). Bounded: the oldest entry leaves at
+    /// capacity.
     fn offer(&mut self, addr: SocketAddr) {
         if self.index.contains(&addr) {
-            if let Some(e) = self.entries.iter_mut().find(|e| e.addr == addr) {
+            if let Some(pos) = self.entries.iter().position(|e| e.addr == addr) {
+                let mut e = self.entries.remove(pos).expect("indexed entry exists");
                 e.fails = 0;
+                self.entries.push_back(e);
             }
             return;
         }
@@ -625,13 +629,8 @@ impl Sampler {
         if answered_as.is_some()
             && let Some(samples) = response.samples.clone()
         {
-            let samples = self.accept_samples(
-                inner.policy,
-                node,
-                &response.id,
-                samples,
-                Instant::now(),
-            );
+            let samples =
+                self.accept_samples(inner.policy, node, &response.id, samples, Instant::now());
             count = samples.len();
             let total = u64::try_from(count).unwrap_or(u64::MAX);
             add(&inner.counters.family(sock.family).samples, total);
@@ -829,8 +828,14 @@ async fn sample_live(inner: &Inner, sampler: &Sampler, sock: &SocketNode, addr: 
 /// Whether this pick probes a live address. NaN share is belt-and-braces
 /// false here (validation already rejects it).
 fn live_probe_due(tuning: &DhtTuning) -> bool {
-    let share = tuning.sampler_live_share;
-    share > 0.0 && rand::random::<f64>() < share
+    live_probe_for_share(tuning.sampler_live_share, rand::random::<f64>())
+}
+
+/// Pure decision predicate behind [`live_probe_due`]: `draw` is one uniform
+/// [0, 1) draw. Split out so the split ratio is testable with a seeded RNG
+/// instead of the thread RNG.
+fn live_probe_for_share(share: f64, draw: f64) -> bool {
+    share > 0.0 && draw < share
 }
 
 /// Backoff and visited identity for a sample response, without touching
@@ -1483,6 +1488,25 @@ mod tests {
         assert_eq!(ring.len(), 3, "reset strikes survive");
         ring.note(a, Some(false));
         assert_eq!(ring.len(), 2, "three consecutive strikes evict");
+        // Re-offered entries move to the back (LRU-ish, not FIFO):
+        // filling to capacity, re-offering the oldest, then adding one
+        // new entry evicts the second-oldest — the hot entry survives.
+        let mut ring2 = LiveRing::new();
+        let mk = |i: u16| SocketAddr::from(([10, 2, 0, 0], 2000 + i));
+        for i in 0..LIVE_RING_CAP as u16 {
+            ring2.offer(mk(i));
+        }
+        ring2.offer(mk(0));
+        ring2.offer(SocketAddr::from(([10, 2, 0, 0], 60_000)));
+        assert_eq!(ring2.len(), LIVE_RING_CAP);
+        assert!(
+            ring2.index.contains(&mk(0)),
+            "re-offered hot entry survives eviction"
+        );
+        assert!(
+            !ring2.index.contains(&mk(1)),
+            "stalest entry evicts first"
+        );
         // Non-verdicts leave the entry alone.
         ring.note(b, None);
         ring.note(b, None);
@@ -1511,5 +1535,25 @@ mod tests {
         assert!(!live_probe_due(&tuning), "NaN never probes");
         tuning.sampler_live_share = 1.0;
         assert!(live_probe_due(&tuning));
+    }
+
+    #[test]
+    fn live_probe_split_ratio_is_about_ten_percent() {
+        // The default 10% share as a statistical check: 10k seeded draws,
+        // 8–12% must probe live. ±2pp is ±6.6σ at N=10k, so a fixed seed
+        // never flakes yet a broken ratio (e.g. 0/100%) fails loudly.
+        let mut rng = StdRng::seed_from_u64(0x5eed_10);
+        let n = 10_000u32;
+        let mut live = 0u32;
+        for _ in 0..n {
+            let draw: f64 = rng.random();
+            if live_probe_for_share(0.10, draw) {
+                live = live.saturating_add(1);
+            }
+        }
+        assert!(
+            (800..=1200).contains(&live),
+            "10% share gave {live}/10000 live probes"
+        );
     }
 }

@@ -181,12 +181,16 @@ pub struct CrawlConfig {
     /// Concurrent BEP 51 queries.
     pub sampler_concurrency: usize,
     /// In-process DHT identities. Each binds `dht_port + i` per family with
-    /// its own node ID and routing table. 1 is today's behavior.
+    /// its own node ID and routing table. 1 is today's behavior. `identities`
+    /// is the port count: no separate `dht_port_count` knob exists (G7) —
+    /// a second count would only duplicate it. The derived range must fit in
+    /// 16 bits and must not overlap `metrics.listen`/`web.listen` (checked
+    /// below, the same-socket collision guard).
     pub identities: u32,
     /// Fraction of sampler picks that probe a live address directly instead
-    /// of traversing the frontier (default 0.10). Validated
-    /// manually to 0.0..=1.0 (NaN rejected) — `check_range` is integer-only
-    /// in effect and NaN slips through comparisons.
+    /// of traversing the frontier (default 0.10). Validated manually to
+    /// 0.0..=1.0 (NaN rejected) — `check_range` compiles for f64 but NaN
+    /// slips through its comparisons, so a manual `contains` check is used.
     pub sampler_live_share: f64,
     pub read_only: bool,
     pub fetch_workers: usize,
@@ -711,15 +715,20 @@ fn has_control(s: &str) -> bool {
 /// One explicit tracker entry: `udp://host:port`, path ignored.
 fn valid_tracker(text: &str) -> Result<(), ConfigError> {
     let rest = text.trim().strip_prefix("udp://").ok_or_else(|| {
-        invalid(format!("crawl.trackers entry {text:?} must be udp://host:port"))
+        invalid(format!(
+            "crawl.trackers entry {text:?} must be udp://host:port"
+        ))
     })?;
     let hostport = rest.split('/').next().unwrap_or("");
     let (host, port) = hostport.split_once(':').ok_or_else(|| {
-        invalid(format!("crawl.trackers entry {text:?} must be udp://host:port"))
+        invalid(format!(
+            "crawl.trackers entry {text:?} must be udp://host:port"
+        ))
     })?;
-    let port: u16 = port.trim().parse().map_err(|_| {
-        invalid(format!("crawl.trackers entry {text:?} has a bad port"))
-    })?;
+    let port: u16 = port
+        .trim()
+        .parse()
+        .map_err(|_| invalid(format!("crawl.trackers entry {text:?} has a bad port")))?;
     if host.trim().is_empty() || port == 0 {
         return Err(invalid(format!(
             "crawl.trackers entry {text:?} must be udp://host:port"
@@ -837,13 +846,10 @@ impl Config {
             1,
             dc4_dht::MAX_SAMPLER_CONCURRENCY,
         )?;
-        check_range(
-            "crawl.identities",
-            c.identities,
-            1,
-            dc4_dht::MAX_IDENTITIES,
-        )?;
-        if u32::from(c.dht_port).saturating_add(c.identities).saturating_sub(1)
+        check_range("crawl.identities", c.identities, 1, dc4_dht::MAX_IDENTITIES)?;
+        if u32::from(c.dht_port)
+            .saturating_add(c.identities)
+            .saturating_sub(1)
             > u32::from(u16::MAX)
         {
             return Err(invalid(
@@ -853,21 +859,19 @@ impl Config {
         // The identity port range must not claim the metrics/web sockets.
         for base in [v4, v6].into_iter().flatten() {
             for i in 0..c.identities {
-                let addr =
-                    SocketAddr::new(base.ip(), base.port().wrapping_add(i as u16));
+                let addr = SocketAddr::new(base.ip(), base.port().wrapping_add(i as u16));
                 if listen_addrs_overlap(addr, self.metrics.listen) {
                     return Err(invalid(format!(
                         "crawl DHT identity {addr} overlaps metrics.listen"
                     )));
                 }
-                if self.web.listen.port() != 0 && listen_addrs_overlap(addr, self.web.listen)
-                {
+                if self.web.listen.port() != 0 && listen_addrs_overlap(addr, self.web.listen) {
                     return Err(invalid(format!(
                         "crawl DHT identity {addr} overlaps web.listen"
                     )));
                 }
             }
-        };
+        }
         // Manual, not `check_range`: NaN slips through `<`/`>` comparisons;
         // `contains` fails NaN (mirrors `DhtTuning::validate`).
         if !(0.0..=1.0).contains(&c.sampler_live_share) {
@@ -1005,12 +1009,7 @@ impl Config {
             1,
             8,
         )?;
-        check_range(
-            "crawl.tracker_scrape_fanout",
-            c.tracker_scrape_fanout,
-            1,
-            4,
-        )?;
+        check_range("crawl.tracker_scrape_fanout", c.tracker_scrape_fanout, 1, 4)?;
         check_range(
             "crawl.tracker_packets_per_sec",
             c.tracker_packets_per_sec,
@@ -1486,8 +1485,31 @@ mod tests {
     }
 
     #[test]
-    fn cross_family_listen_addrs_overlap() {
+    fn identity_range_vs_metrics_and_web_is_rejected() {
+        // WS4: with N identities the DHT claims `dht_port..dht_port+N`;
+        // any identity colliding with metrics/web is a validation error,
+        // not a runtime `EADDRINUSE`.
         let mut c = Config::default();
+        assert!(c.validate().is_ok());
+        // Identity 1 of 2 lands on the metrics port.
+        c.crawl.dht_port = 9099;
+        c.crawl.identities = 2;
+        c.crawl.bind_v6 = String::new();
+        c.metrics.listen = "127.0.0.1:9100".parse().unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("overlaps metrics"), "{err}");
+        // Same range against the web socket.
+        c.metrics.listen = "127.0.0.1:9199".parse().unwrap();
+        c.web.listen = "127.0.0.1:9100".parse().unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("overlaps web"), "{err}");
+        // A clear range validates.
+        c.web.listen = "127.0.0.1:8080".parse().unwrap();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cross_family_listen_addrs_overlap() {        let mut c = Config::default();
         // IPv4 wildcard vs IPv6 loopback on the same port: distinct sockets
         // (an IPv4 wildcard never claims an IPv6 port).
         c.metrics.listen = "0.0.0.0:9100".parse().unwrap();
@@ -1656,6 +1678,8 @@ mod tests {
             ("DC4_CRAWL__SCRAPE_CONCURRENCY", "17"),
             ("DC4_CRAWL__SCRAPE_PACKETS_PER_SEC", "0"),
             ("DC4_CRAWL__SCRAPE_PACKETS_PER_SEC", "251"),
+            ("DC4_CRAWL__FETCH_PACKETS_PER_SEC", "0"),
+            ("DC4_CRAWL__FETCH_PACKETS_PER_SEC", "4294967296"),
             ("DC4_CRAWL__REMOVAL_COOLDOWN_DAYS", "0"),
             ("DC4_CRAWL__REMOVAL_COOLDOWN_DAYS", "366"),
             ("DC4_CRAWL__TOMBSTONE_PURGE_HOURS", "169"),

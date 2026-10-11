@@ -98,6 +98,9 @@ services:
       - "6881:6881/udp"   # IPv4 and IPv6. With crawl.identities = N > 1,
                           # publish "6881-688N:6881-688N/udp" and open the
                           # same range on the firewall instead.
+                          # Example for N = 8 (commented: uncomment and drop
+                          # the single-port line above when identities > 1):
+                          # - "6881-6888:6881-6888/udp"
     volumes:
       - state:/var/lib/dhtcrawler4
     networks: [backend, egress]

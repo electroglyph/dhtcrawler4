@@ -93,8 +93,9 @@ scrape_concurrency = 3
 scrape_packets_per_sec = 100
 # Dedicated outbound packet budget for fetch traversals (burst: 1s).
 # Fetch runs ~2,000 lookups/s measured, so 6000 gives ~3x headroom; fetch
-# alone can never be the binding constraint. Total egress ≈ 6k main + 6k
-# fetch + 100 scrape, near the historic 12k envelope.
+# alone can never be the binding constraint. Total default egress is
+# 12k main + 6k fetch + 100 scrape (~18.1k, up ~6k/s over the old
+# 12k-only envelope).
 fetch_packets_per_sec = 6000
 # UDP tracker hybrid: scrape triage plus one-shot announces for
 # triage-positive keys. Enabled by default; false means DHT-only fetch and

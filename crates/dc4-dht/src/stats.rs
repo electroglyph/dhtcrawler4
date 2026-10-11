@@ -507,8 +507,40 @@ mod tests {
     }
 
     #[test]
-    fn method_labels() {
-        let c = MethodCounters::default();
+    fn throttled_split_labels_are_distinct_per_site() {
+        // WS1: the old single `throttled` label is split per drop site so
+        // dashboards can tell spacing/budget-main/budget-scrape/
+        // budget-fetch/txn-full apart.
+        assert_eq!(DropReason::ThrottledSpacing.as_str(), "throttled_spacing");
+        assert_eq!(
+            DropReason::ThrottledBudgetMain.as_str(),
+            "throttled_budget_main"
+        );
+        assert_eq!(
+            DropReason::ThrottledBudgetScrape.as_str(),
+            "throttled_budget_scrape"
+        );
+        assert_eq!(
+            DropReason::ThrottledBudgetFetch.as_str(),
+            "throttled_budget_fetch"
+        );
+        assert_eq!(DropReason::ThrottledTxnFull.as_str(), "throttled_txn_full");
+        let c = Counters::default();
+        c.family(Family::V4)
+            .drop_packet(DropReason::ThrottledBudgetFetch);
+        c.family(Family::V4)
+            .drop_packet(DropReason::ThrottledBudgetScrape);
+        c.family(Family::V4).drop_packet(DropReason::ThrottledBudgetMain);
+        let s = c.snapshot();
+        assert_eq!(s.v4.dropped.throttled_budget_fetch, 1);
+        assert_eq!(s.v4.dropped.throttled_budget_scrape, 1);
+        assert_eq!(s.v4.dropped.throttled_budget_main, 1);
+        assert_eq!(s.v4.dropped.throttled_spacing, 0);
+        assert_eq!(s.v4.dropped.throttled_txn_full, 0);
+    }
+
+    #[test]
+    fn method_labels() {        let c = MethodCounters::default();
         c.count(&Method::Ping);
         c.count(&Method::GetPeers {
             info_hash: dc4_core::DhtKey([0; 20]),

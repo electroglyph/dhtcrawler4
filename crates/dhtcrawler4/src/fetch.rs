@@ -35,7 +35,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::{METRIC_HINT_USED, SharedHints, add_hint, take_hints};
+use crate::admission::{METRIC_HINT_ADDED, METRIC_HINT_USED, SharedHints, add_hint, take_hints};
 use crate::peers::{OwnAddrs, PeerFilter, PeerSource};
 use crate::stores::CrawlStore;
 use crate::tracker::TrackerHandle;
@@ -941,9 +941,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 let fut = async move { t.triage(key).await };
                 Box::pin(fut) as Pin<Box<dyn Future<Output = Option<u32>> + Send>>
             });
-        let mut announce: Option<
-            Pin<Box<dyn Future<Output = Vec<SocketAddr>> + Send>>,
-        > = None;
+        let mut announce: Option<Pin<Box<dyn Future<Output = Vec<SocketAddr>> + Send>>> = None;
         loop {
             if queue.is_empty() {
                 deferred.requeue(&mut queue, progress);
@@ -1019,8 +1017,13 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                             // first instead of re-traversing from scratch.
                             // `take` is destructive, so these survive only
                             // for the NEXT `obtain()` — this one already
-                            // holds them in `seen`, no double-dial.
+                            // holds them in `seen`, no double-dial. Counted
+                            // as `dc4_hint_added_total{source="traversal"}`
+                            // so adds join with `hint_used{outcome="dialed"}`
+                            // on the retry.
                             add_hint(&self.hints, key, peer, Instant::now());
+                            metrics::counter!(METRIC_HINT_ADDED, "source" => "traversal")
+                                .increment(1);
                             queue.push_back(peer);
                         }
                     }
@@ -1060,7 +1063,14 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                         if let Some(peer) = self.filter.accept(peer, &own)
                             && seen.insert(peer)
                         {
+                            // Tracker-announced peers double as retry hints
+                            // (same bounded `HintMap::add` as traversal), so
+                            // a retry redials them without re-announcing.
+                            // Counted as `source="tracker"` to join with
+                            // `hint_used{outcome="dialed"}` on the retry.
                             add_hint(&self.hints, key, peer, Instant::now());
+                            metrics::counter!(METRIC_HINT_ADDED, "source" => "tracker")
+                                .increment(1);
                             queue.push_back(peer);
                         }
                     }
@@ -1069,10 +1079,9 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                     progress = progress.saturating_add(1);
                     match result {
                         Ok(info) => {
-                            // a peer that served
-                            // metadata just proved live — feed the sampler's
-                            // live ring (hint-connected peers included: a
-                            // successful dial connected by definition).
+                            // Already fed on TCP connect (see `attempt`); re-offer:
+                            // a peer that served metadata just proved live again,
+                            // resetting the ring's fail count.
                             self.peers.note_live_addr(peer);
                             return Obtained::Metadata(info);
                         }
@@ -1106,7 +1115,15 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
             max_metadata: self.max_metadata,
             byte_budget: Some(Arc::clone(&self.byte_budget)),
         };
-        let result = dc4_peer::fetch_metadata(peer, key, &limits).await;
+        // TCP connect success already proves the addr is live, even when the
+        // handshake or metadata later fails — this feeds source (b), hint
+        // peers that connected. The dialable pre-filter still applies inside
+        // `Inner::offer_live`.
+        let live = self.peers.clone();
+        let result = dc4_peer::fetch_metadata_with_hook(peer, key, &limits, move || {
+            live.note_live_addr(peer)
+        })
+        .await;
         let ttl = match &result {
             Err(e) => negative_ttl_for(e, &self.tuning.destinations),
             Ok(_) => None,
@@ -2282,6 +2299,26 @@ mod tests {
         assert!(hints.lock().unwrap().is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn hint_and_traversal_duplicates_dial_once() {
+        // WS2 `seen` dedupe: the same address arriving via a pre-loaded
+        // hint AND the traversal script must be dialed exactly once in
+        // one `obtain()` — no double-dial.
+        let store = MemoryStore::new();
+        let hints = shared_hints(&AdmissionTuning::default());
+        let (addr, dials) = counting_listener().await;
+        let k = DhtKey([78; 20]);
+        add_hint(&hints, k, addr, Instant::now());
+        let peers = ScriptedLookups::new(vec![vec![addr]]);
+        let f = fetcher_with_hints(&store, peers, test_tuning(), hints);
+        assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same peer via hint + traversal dials once"
+        );
+    }
+
     /// A mock UDP tracker: connects, scrapes every key at 3 seeders,
     /// announces one peer (the counting listener).
     async fn mock_tracker(peer: SocketAddr) -> SocketAddr {
@@ -2521,6 +2558,75 @@ mod tests {
         assert_eq!(peers.calls(), 1);
         assert_eq!(dial_count(&hint_counters), 2, "both hints dialed");
         assert_eq!(dial_count(&lookup_counters), 1, "one lookup peer left");
+    }
+
+    #[test]
+    fn hint_metrics_added_and_used() {
+        // Retry-hint adds count `dc4_hint_added_total{source}` and takes
+        // count `dc4_hint_used_total{outcome}`, so the two join: every
+        // `dialed` on a retry has a matching `traversal` add. Same local
+        // recorder + current-thread pattern as
+        // `fetch_and_dial_metrics_carry_the_claim_time_bucket`.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    // Empty: no hints, peerless lookup.
+                    let store = MemoryStore::new();
+                    let peers = ScriptedLookups::new(vec![Vec::new()]);
+                    let f = fetcher_with(&store, peers, test_tuning());
+                    assert!(matches!(
+                        f.obtain(DhtKey([210; 20]), None).await,
+                        Obtained::NoPeers
+                    ));
+                    // Traversal add: one lookup-found peer, dialed this
+                    // round (accept-then-drop listener fails fast at the
+                    // handshake), kept as a retry hint.
+                    let store = MemoryStore::new();
+                    let hints = shared_hints(&AdmissionTuning::default());
+                    let (addr, _) = counting_listener().await;
+                    let peers = ScriptedLookups::new(vec![vec![addr]]);
+                    let f = fetcher_with_hints(&store, peers, test_tuning(), hints.clone());
+                    let k = DhtKey([211; 20]);
+                    assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+                    assert_eq!(hints.lock().unwrap().len(), 1);
+                    // Dialed: the retry consumes the hint (script exhausted,
+                    // so the lookup adds nothing).
+                    assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+                    assert!(hints.lock().unwrap().is_empty());
+                    // Filtered: an undialable hint (port 0 never passes the
+                    // chokepoint, even with private addresses allowed).
+                    let store = MemoryStore::new();
+                    let hints = shared_hints(&AdmissionTuning::default());
+                    let bad: SocketAddr = "1.1.1.1:0".parse().unwrap();
+                    let k = DhtKey([212; 20]);
+                    lock(&hints).add(k, bad, Instant::now());
+                    let peers = ScriptedLookups::new(vec![Vec::new()]);
+                    let f = fetcher_with_hints(&store, peers, test_tuning(), hints);
+                    assert!(matches!(f.obtain(k, None).await, Obtained::NoPeers));
+                });
+        });
+        let text = handle.render();
+        assert!(
+            text.contains("dc4_hint_added_total{source=\"traversal\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dc4_hint_used_total{outcome=\"empty\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dc4_hint_used_total{outcome=\"dialed\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dc4_hint_used_total{outcome=\"filtered\"} 1"),
+            "{text}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

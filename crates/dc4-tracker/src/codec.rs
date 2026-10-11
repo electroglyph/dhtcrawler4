@@ -39,11 +39,15 @@ pub struct AnnounceReply {
 }
 
 /// A decoded tracker reply, matched by callers on transaction ID.
+/// `Error` carries the tracker's `error`-action text: callers treat it
+/// as failure and retry with a fresh connection ID (the demux loop
+/// already dropped the cached ID when the text reports an invalid one).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
     Connect { connection_id: u64 },
     Announce(AnnounceReply),
     Scrape(Vec<ScrapeRow>),
+    Error(String),
 }
 
 /// Error text of an `error` action reply.
@@ -249,6 +253,33 @@ mod tests {
             vec!["1.2.3.4:6881".parse().unwrap()],
             "port-0 peers are dropped"
         );
+    }
+
+    #[test]
+    fn scrape_handles_max_capacity_rows() {
+        // 74-hash max-capacity response vector: every row decodes.
+        let mut reply = vec![0u8; 8 + 12 * MAX_SCRAPE_HASHES];
+        reply[0..4].copy_from_slice(&2u32.to_be_bytes());
+        for i in 0..MAX_SCRAPE_HASHES {
+            reply[8 + 12 * i..12 + 12 * i].copy_from_slice(&(i as u32).to_be_bytes());
+            reply[12 + 12 * i..16 + 12 * i].copy_from_slice(&((i * 2) as u32).to_be_bytes());
+            reply[16 + 12 * i..20 + 12 * i].copy_from_slice(&((i * 3) as u32).to_be_bytes());
+        }
+        let rows = decode_scrape(&reply, MAX_SCRAPE_HASHES).unwrap();
+        assert_eq!(rows.len(), MAX_SCRAPE_HASHES);
+        assert_eq!(
+            rows[0],
+            ScrapeRow {
+                seeders: 0,
+                completed: 0,
+                leechers: 0
+            }
+        );
+        assert_eq!(rows[73].seeders, 73);
+        assert_eq!(rows[73].completed, 146);
+        assert_eq!(rows[73].leechers, 219);
+        // Asking for fewer rows truncates the decode, not the packet.
+        assert_eq!(decode_scrape(&reply, 1).unwrap().len(), 1);
     }
 
     #[test]

@@ -438,8 +438,14 @@ pub fn take_hints(hints: &SharedHints, key: &DhtKey, now: Instant) -> Vec<Socket
 /// Records one hint on a shared map (traversal-found peers
 /// become retry hints). Bounded by the same per-key cap as the add path;
 /// `get_peers`-sourced peers are deliberately NOT added at the admission
-/// add-path — they arrive through traversal and would double-dial there —
-/// only lookup-success peers recorded here, for the *next* `obtain()`.
+/// add-path: producers set `peer: None` for `GetPeers`/`Sample` (only
+/// `Announce` carries `Some`), so `handle()` structurally never sees one —
+/// and traversal peers would double-dial if re-added there. Only
+/// lookup-success peers are recorded here, for the *next* `obtain()`.
+/// The map itself does not count: callers emit
+/// `dc4_hint_added_total{source="traversal"}` (fetch traversal peers) or
+/// `{source="tracker"}` (tracker announce peers) alongside the add, so adds
+/// join with `dc4_hint_used_total{outcome="dialed"}` on the retry.
 pub fn add_hint(hints: &SharedHints, key: DhtKey, peer: SocketAddr, now: Instant) {
     lock(hints).add(key, peer, now);
 }
@@ -594,8 +600,7 @@ impl<S: CrawlStore> Admission<S> {
             match self.filter.accept(peer, own) {
                 Some(peer) => {
                     lock(&self.hints).add(event.key, peer, now);
-                    metrics::counter!(METRIC_HINT_ADDED, "source" => source.as_str())
-                        .increment(1);
+                    metrics::counter!(METRIC_HINT_ADDED, "source" => source.as_str()).increment(1);
                 }
                 None => {
                     metrics::counter!(METRIC_BLOCKED, "reason" => "peer_address").increment(1);
@@ -1564,6 +1569,32 @@ mod tests {
         assert_eq!(small.len(), 2);
         assert!(small.take(&key(0), t0).is_empty());
         assert_eq!(small.take(&key(4), t0).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_peers_events_add_no_retry_hints() {
+        // WS2: `get_peers`-sourced sightings must not become retry hints —
+        // traversal already queues those peers, so re-adding would
+        // double-dial. Producers emit `peer: None` for `GetPeers` (only
+        // `Announce` carries a peer); the admission add-path therefore
+        // records nothing for them while announce peers land in the map.
+        let store = MemoryStore::new();
+        let mut a = admission(&store, PeerFilter::PRODUCTION);
+        let own = OwnAddrs::new(vec![ip("8.8.4.4")], vec![]);
+        let t0 = Instant::now();
+        let k = key(9);
+        a.handle(event(k, Source::GetPeers, "8.8.8.8", None), &own, t0);
+        a.handle(event(k, Source::Sample, "8.8.8.8", None), &own, t0);
+        assert!(
+            take_hints(&a.hints, &k, t0).is_empty(),
+            "peerless get_peers/sample events add no hints"
+        );
+        a.handle(
+            event(k, Source::Announce, "8.8.8.8", Some("8.8.8.8:6881")),
+            &own,
+            t0,
+        );
+        assert_eq!(take_hints(&a.hints, &k, t0), vec![sa("8.8.8.8:6881")]);
     }
 
     #[tokio::test(start_paused = true)]

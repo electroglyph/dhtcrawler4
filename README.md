@@ -501,7 +501,10 @@ Expect the first searchable torrents within minutes and a steadily growing
 index over hours to days. The default crawl budget (`max_packets_per_sec =
 12000`, `fetch_packets_per_sec = 6000` for fetch traversals, 3072 fetch
 workers) is sized for a server; lower it in
-`deploy/config/dhtcrawler4.toml` on a home connection.
+`deploy/config/dhtcrawler4.toml` on a home connection. Trap: setting
+`fetch_packets_per_sec` (or any packet budget) to `"0"` means "treated as
+one" (`TokenBucket::new`), strangling that path to 1 pkt/s — rollback is
+revert + rebuild, never `"0"`.
 
 ### 8. Day-to-day operation
 
@@ -557,6 +560,11 @@ docker compose ps                     # includes healthcheck status
   per family, own routing table per identity, everything else shared. Publish
   the port range and start with 2-4; back to `1` plus a restart to roll back.
   Extra identities cost ~2-5 MB RAM each; abort past ~15 MB/identity.
+  Outbound lookups route per family through the XOR-closest identity and fan
+  out to the remaining identities when the closest finds nothing; a port
+  already in use surfaces as a clear bind error at startup. `identities` is
+  the port count (no separate `dht_port_count` knob): the derived range must
+  fit in 16 bits and not overlap the metrics/web sockets.
 
 ### Without Docker
 
@@ -794,10 +802,11 @@ How to read the output:
   the purge catches depth below the cap. Announced-peer direct dials show as
   `dc4_hint_used_total{outcome="dialed"}`; `empty` dominating means the gap
   is upstream (adds, see `dc4_hint_added_total{source}` vs
-  `dc4_blocked_total{reason="peer_address"}` filter drops), and traversal
-  peers feeding retries is expected (`dialed` without a matching add means
-  retries are working). `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
-  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Announces expose our IP per hash to tracker operators, same as DHT participation.
+  `dc4_blocked_total{reason="peer_address"}` filter drops), and traversal /
+  tracker peers feeding retries show as `dc4_hint_added_total{source="traversal"}`
+  / `{source="tracker"}` with a matching `dialed` on the retry.
+  `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
+  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). See the `dc4-tracker` crate docs for the full good-citizen subset.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches

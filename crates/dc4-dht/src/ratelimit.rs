@@ -401,6 +401,40 @@ mod tests {
     }
 
     #[test]
+    fn fetch_and_scrape_buckets_are_independent() {
+        // WS1: fetch traversals (6 000/s) charge their own bucket, never the
+        // 100/s scrape bucket; per-address spacing stays shared (see
+        // `query_spacing`). Draining either bucket must not touch the other.
+        // Binding: `query_fetch` charges `fetch_budget`, `query_scrape`
+        // charges `scrape_budget` (node.rs), routed by `Kind::budget`
+        // (lookup.rs).
+        let t0 = Instant::now();
+        let mut fetch = TokenBucket::new(6000, 6000, t0);
+        let mut scrape = TokenBucket::new(100, 100, t0);
+        for _ in 0..100 {
+            assert!(scrape.try_acquire(t0));
+        }
+        assert!(!scrape.try_acquire(t0));
+        // The fetch bucket is still full after the scrape bucket drained.
+        for i in 0..6000 {
+            assert!(fetch.try_acquire(t0), "fetch packet {i}");
+        }
+        assert!(!fetch.try_acquire(t0));
+        // And vice versa from fresh buckets: a drained fetch bucket leaves
+        // scrapes usable.
+        let mut fetch = TokenBucket::new(6000, 6000, t0);
+        let mut scrape = TokenBucket::new(100, 100, t0);
+        for _ in 0..6000 {
+            assert!(fetch.try_acquire(t0));
+        }
+        assert!(!fetch.try_acquire(t0));
+        for i in 0..100 {
+            assert!(scrape.try_acquire(t0), "scrape packet {i}");
+        }
+        assert!(!scrape.try_acquire(t0));
+    }
+
+    #[test]
     fn bucket_takes_and_refunds_several_tokens() {
         let t0 = Instant::now();
         let mut b = TokenBucket::new(1000, 1000, t0);

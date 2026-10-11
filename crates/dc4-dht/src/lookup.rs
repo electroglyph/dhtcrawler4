@@ -51,6 +51,41 @@ enum Kind {
     FetchPeers,
 }
 
+/// Which outbound budget a traversal charges: crawl, scrape or fetch.
+/// Pure so tests can pin the routing without network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budget {
+    Main,
+    Scrape,
+    Fetch,
+}
+
+impl Kind {
+    /// The wire query of this traversal kind.
+    fn method(self, target: NodeId) -> Method {
+        match self {
+            Kind::FindNode => Method::FindNode { target },
+            Kind::GetPeers => Method::GetPeers {
+                info_hash: DhtKey::from(target),
+                scrape: false,
+            },
+            Kind::Scrape | Kind::FetchPeers => Method::GetPeers {
+                info_hash: DhtKey::from(target),
+                scrape: true,
+            },
+        }
+    }
+
+    /// The budget this traversal charges.
+    fn budget(self) -> Budget {
+        match self {
+            Kind::FindNode | Kind::GetPeers => Budget::Main,
+            Kind::Scrape => Budget::Scrape,
+            Kind::FetchPeers => Budget::Fetch,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CandState {
     Fresh,
@@ -266,7 +301,8 @@ impl Lookup {
         };
         cand.state = CandState::Responded;
         cand.token = response.token;
-        if self.kind == Kind::GetPeers || self.kind == Kind::Scrape || self.kind == Kind::FetchPeers {
+        if self.kind == Kind::GetPeers || self.kind == Kind::Scrape || self.kind == Kind::FetchPeers
+        {
             for peer in response.values.unwrap_or_default() {
                 if self.peers.len() >= MAX_LOOKUP_PEERS {
                     break;
@@ -377,49 +413,23 @@ async fn ask(
     kind: Kind,
     target: NodeId,
 ) -> (SocketAddr, Result<Response, QueryError>) {
-    match kind {
-        Kind::FindNode => {
-            let method = Method::FindNode { target };
-            (
-                node.addr,
-                inner.query(sock, node.addr, method, Some(node.id)).await,
-            )
+    // The budget dispatch is load-bearing (see `Kind::budget`): scrape and
+    // fetch share the `scrape=1` wire shape but must never share a bucket.
+    let method = kind.method(target);
+    let reply = match kind.budget() {
+        Budget::Main => inner.query(sock, node.addr, method, Some(node.id)).await,
+        Budget::Scrape => {
+            inner
+                .query_scrape(sock, node.addr, method, Some(node.id))
+                .await
         }
-        Kind::GetPeers => {
-            let method = Method::GetPeers {
-                info_hash: DhtKey::from(target),
-                scrape: false,
-            };
-            (
-                node.addr,
-                inner.query(sock, node.addr, method, Some(node.id)).await,
-            )
+        Budget::Fetch => {
+            inner
+                .query_fetch(sock, node.addr, method, Some(node.id))
+                .await
         }
-        Kind::Scrape => {
-            let method = Method::GetPeers {
-                info_hash: DhtKey::from(target),
-                scrape: true,
-            };
-            (
-                node.addr,
-                inner
-                    .query_scrape(sock, node.addr, method, Some(node.id))
-                    .await,
-            )
-        }
-        Kind::FetchPeers => {
-            let method = Method::GetPeers {
-                info_hash: DhtKey::from(target),
-                scrape: true,
-            };
-            (
-                node.addr,
-                inner
-                    .query_fetch(sock, node.addr, method, Some(node.id))
-                    .await,
-            )
-        }
-    }
+    };
+    (node.addr, reply)
 }
 
 /// Whether a reply counts towards `answered` for the final-sweep decision:
@@ -1013,6 +1023,36 @@ mod tests {
         assert_eq!(out.unaware, 1);
         assert_eq!(out.seed_filters.len(), 1);
         assert_eq!(crate::bloom::estimate_or(&out.seed_filters), Some(1));
+    }
+
+    #[test]
+    fn kind_routes_fetch_to_its_own_budget() {
+        // WS1: scrape and fetch share the `scrape=1` wire shape (so the BEP
+        // 33 seed filters still feed the queue's liveness ordering) but must
+        // never share a bucket. `ask` dispatches on both halves together, so
+        // pin them together: a refactor that moves one without the other
+        // fails here, not as a production starvation.
+        let target = NodeId([7; 20]);
+        let scraped = Method::GetPeers {
+            info_hash: DhtKey::from(target),
+            scrape: true,
+        };
+        assert_eq!(Kind::Scrape.method(target), scraped);
+        assert_eq!(Kind::FetchPeers.method(target), scraped);
+        assert_eq!(Kind::Scrape.budget(), Budget::Scrape);
+        assert_eq!(Kind::FetchPeers.budget(), Budget::Fetch);
+        // The crawl kinds keep the main bucket, and plain `get_peers`
+        // stays `scrape=false`.
+        assert_eq!(Kind::FindNode.budget(), Budget::Main);
+        assert_eq!(Kind::GetPeers.budget(), Budget::Main);
+        assert_eq!(Kind::FindNode.method(target), Method::FindNode { target });
+        assert_eq!(
+            Kind::GetPeers.method(target),
+            Method::GetPeers {
+                info_hash: DhtKey::from(target),
+                scrape: false,
+            }
+        );
     }
 
     #[test]

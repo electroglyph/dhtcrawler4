@@ -34,8 +34,8 @@ pub const MAX_IDENTITIES: u32 = 8;
 /// Default dedicated fetch budget in packets per second:
 /// fetch traversals are multi-packet lookups running at ~2,000+/s measured,
 /// so 6,000 gives ~3x headroom — fetch alone can never be the binding
-/// constraint while staying near the historic total egress envelope
-/// (6k main + 6k fetch + 100 scrape ≈ old 12k default).
+/// constraint. Total default egress is 12k main + 6k fetch + 100 scrape
+/// (≈18.1k, up ~6k/s over the old 12k-only envelope).
 pub const DEFAULT_FETCH_PACKETS_PER_SEC: u32 = 6_000;
 /// Upper bound on `sampler_concurrency`.
 pub const MAX_SAMPLER_CONCURRENCY: usize = 1024;
@@ -70,8 +70,13 @@ pub struct DhtConfig {
     /// `get_peers` traversals charge this bucket, never the scrape bucket.
     pub fetch_packets_per_sec: u32,
     /// In-process DHT identities. Each binds its own UDP port per family
-    /// (`dht_port + i`), with its own node ID and routing table. 1 is
-    /// today's behavior. Ports are derived from `dht_port`, no extra knob.
+    /// (`dht_port + i` for `i` in `0..identities`), with its own node ID
+    /// and routing table. 1 is today's behavior. `identities` is the port
+    /// count: no separate `dht_port_count` knob exists (G7) because a second
+    /// count would only duplicate it and risk mismatch. The derived range
+    /// `dht_port..dht_port + identities - 1` is validated to fit in 16 bits
+    /// and to not overlap `metrics.listen`/`web.listen` at the
+    /// `dhtcrawler4` config layer (the same-socket collision guard).
     pub identities: u32,
     /// Run the BEP 51 sampler, which emits `Discovered { source: Sample }`.
     pub sampler: bool,
@@ -145,6 +150,23 @@ impl DhtConfig {
             return Err(Error::Config(format!(
                 "identities must be between 1 and {MAX_IDENTITIES}"
             )));
+        }
+        // 16-bit fit for the derived `port + i` range, per bound family
+        // (port 0 stays ephemeral per identity, no fit issue). Mirrors the
+        // `dhtcrawler4`-layer guard so direct library users get the same
+        // error instead of a wrapped port from `wrapping_add`.
+        for bound in [self.bind_v4, self.bind_v6].into_iter().flatten() {
+            let port = bound.port();
+            if port != 0
+                && u32::from(port) + u32::from(self.identities) - 1 > u32::from(u16::MAX)
+            {
+                return Err(Error::Config(format!(
+                    "dht port range {}..{} exceeds 65535 for {} identities",
+                    port,
+                    u32::from(port) + u32::from(self.identities) - 1,
+                    self.identities
+                )));
+            }
         }
         if self.sampler_concurrency == 0 || self.sampler_concurrency > MAX_SAMPLER_CONCURRENCY {
             return Err(Error::Config(format!(
@@ -385,6 +407,7 @@ mod tests {
         let c = DhtConfig::default();
         assert_eq!(c.bind_v4, Some("0.0.0.0:6881".parse().unwrap()));
         assert_eq!(c.bind_v6, Some("[::]:6881".parse().unwrap()));
+        assert_eq!(c.identities, 1);
         assert_eq!(
             c.bootstrap,
             [
@@ -397,6 +420,9 @@ mod tests {
         assert_eq!(c.state_file, None);
         assert_eq!(c.max_packets_per_sec, DEFAULT_MAX_PACKETS_PER_SEC);
         assert_eq!(c.scrape_packets_per_sec, 100);
+        assert_eq!(c.fetch_packets_per_sec, DEFAULT_FETCH_PACKETS_PER_SEC);
+        assert_eq!(c.fetch_packets_per_sec, 6_000);
+        assert_eq!(c.identities, 1);
         assert!(c.sampler);
         assert_eq!(c.sampler_concurrency, DEFAULT_SAMPLER_CONCURRENCY);
         assert!(!c.read_only);
@@ -481,8 +507,47 @@ mod tests {
     }
 
     #[test]
-    fn sampler_live_share_defaults_and_rejects_nan() {
-        // 10% of sampler picks probe live addrs; NaN would
+    fn identities_range_and_port_fit_are_validated() {
+        // WS4: `identities` is the port count (`dht_port + i`), so the
+        // range and the 16-bit fit of the derived range are both checked
+        // at the library layer, not just the crawl layer.
+        let c = DhtConfig::default();
+        assert_eq!(c.identities, 1);
+        assert!(c.validate().is_ok());
+        for bad_n in [0, MAX_IDENTITIES + 1] {
+            let bad = DhtConfig {
+                identities: bad_n,
+                ..DhtConfig::default()
+            };
+            assert!(bad.validate().is_err(), "identities={bad_n} must fail");
+        }
+        // 65535 + 1 identity fits; + 2 identities wraps past 16 bits.
+        let fit = DhtConfig {
+            bind_v4: Some("0.0.0.0:65535".parse().unwrap()),
+            bind_v6: None,
+            identities: 1,
+            ..DhtConfig::default()
+        };
+        assert!(fit.validate().is_ok());
+        let wrap = DhtConfig {
+            bind_v4: Some("0.0.0.0:65535".parse().unwrap()),
+            bind_v6: None,
+            identities: 2,
+            ..DhtConfig::default()
+        };
+        assert!(wrap.validate().is_err());
+        // Port 0 stays ephemeral per identity: no fit issue at any N.
+        let eph = DhtConfig {
+            bind_v4: Some("0.0.0.0:0".parse().unwrap()),
+            bind_v6: None,
+            identities: MAX_IDENTITIES,
+            ..DhtConfig::default()
+        };
+        assert!(eph.validate().is_ok());
+    }
+
+    #[test]
+    fn sampler_live_share_defaults_and_rejects_nan() {        // 10% of sampler picks probe live addrs; NaN would
         // silently disable or misbehave, so it is rejected explicitly.
         assert_eq!(DhtTuning::default().sampler_live_share, 0.10);
         let mut tuning = DhtTuning::default();

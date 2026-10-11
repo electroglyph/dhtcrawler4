@@ -1,6 +1,7 @@
 //! A Mainline DHT node for dhtcrawler4 (BEP 5, 32, 42, 43, 51).
 //!
-//! [`Dht::start`] binds one UDP socket per address family and runs:
+//! [`Dht::start`] binds `identities` UDP sockets per address family
+//! (`dht_port + i`) and runs:
 //! * a compliant responder (`ping`, `find_node`, `get_peers`,
 //!   `announce_peer`, `sample_infohashes`) with real tokens, KRPC errors and
 //!   its own reply budget;
@@ -73,7 +74,8 @@ fn closest_per_family(ids: &[(Family, NodeId)], target: &NodeId) -> Vec<usize> {
 
 /// One socket per family: the identity whose ID is XOR-closest to `target`.
 /// Fewer hops per lookup than querying from every identity. With one
-/// identity this is the same set as before.
+/// identity this is the same set as before. When the closest socket's
+/// traversal finds nothing, the caller fans out to [`fallback_sockets`].
 fn route_sockets(inner: &crate::node::Inner, target: &NodeId) -> Vec<Arc<crate::node::SocketNode>> {
     let ids: Vec<(Family, NodeId)> = inner
         .sockets
@@ -86,13 +88,59 @@ fn route_sockets(inner: &crate::node::Inner, target: &NodeId) -> Vec<Arc<crate::
         .collect()
 }
 
+/// Fallback order when the closest socket's traversal finds nothing: the
+/// remaining identities of each family, closest first.
+///
+/// Distance is a pure function of the IDs so it is always available;
+/// round-robin across the same-family sockets is the degenerate fallback if
+/// it ever were not (never — kept documented so the spec's fallback chain
+/// has no unhandled case).
+fn fallback_per_family(ids: &[(Family, NodeId)], target: &NodeId, primary: &[usize]) -> Vec<usize> {
+    let mut families: Vec<Family> = Vec::new();
+    for (family, _) in ids {
+        if !families.contains(family) {
+            families.push(*family);
+        }
+    }
+    let mut out = Vec::new();
+    for family in families {
+        let mut rest: Vec<(crate::node_id::Distance, usize)> = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, (f, _))| *f == family && !primary.contains(i))
+            .map(|(i, (_, id))| (id.distance(target), i))
+            .collect();
+        rest.sort();
+        out.extend(rest.into_iter().map(|(_, i)| i));
+    }
+    out
+}
+
+/// The non-closest identities, closest first per family: queried only when
+/// the closest socket's traversal finds nothing (WS4 fallback fan-out).
+/// Empty with one identity per family (nothing to fall back to).
+fn fallback_sockets(
+    inner: &crate::node::Inner,
+    target: &NodeId,
+) -> Vec<Arc<crate::node::SocketNode>> {
+    let ids: Vec<(Family, NodeId)> = inner
+        .sockets
+        .iter()
+        .map(|s| (s.family, lock(&s.state).id))
+        .collect();
+    let primary = closest_per_family(&ids, target);
+    fallback_per_family(&ids, target, &primary)
+        .into_iter()
+        .map(|i| Arc::clone(&inner.sockets[i]))
+        .collect()
+}
+
 pub use compact::{Family, is_dialable};
 pub use config::{
     DEFAULT_BOOTSTRAP, DEFAULT_CLIENT_VERSION, DEFAULT_FETCH_PACKETS_PER_SEC,
     DEFAULT_MAX_PACKETS_PER_SEC, DEFAULT_PORT, DEFAULT_RESPONDER_BYTES_PER_SEC,
-    DEFAULT_RESPONDER_REPLIES_PER_SEC, DEFAULT_SAMPLER_CONCURRENCY,
-    DEFAULT_SCRAPE_PACKETS_PER_SEC, DhtConfig, DhtTuning, MAX_IDENTITIES,
-    MAX_SAMPLER_CONCURRENCY,
+    DEFAULT_RESPONDER_REPLIES_PER_SEC, DEFAULT_SAMPLER_CONCURRENCY, DEFAULT_SCRAPE_PACKETS_PER_SEC,
+    DhtConfig, DhtTuning, MAX_IDENTITIES, MAX_SAMPLER_CONCURRENCY,
 };
 pub use node::MIN_GOOD_NODES;
 pub use node_id::NodeId;
@@ -253,12 +301,30 @@ impl Dht {
             .iter()
             .map(|sock| lookup::get_peers(&self.inner, sock, key, deadline));
         let mut seen = HashSet::new();
-        join_all(lookups)
+        let mut peers: Vec<SocketAddr> = join_all(lookups)
             .await
             .into_iter()
             .flat_map(|outcome| outcome.peers)
             .filter(|peer| seen.insert(*peer))
-            .collect()
+            .collect();
+        // Fallback fan-out: the closest socket found nothing, so try the
+        // remaining identities (closest first per family).
+        if peers.is_empty() {
+            let fallback = fallback_sockets(&self.inner, &target);
+            if !fallback.is_empty() {
+                let more = fallback
+                    .iter()
+                    .map(|sock| lookup::get_peers(&self.inner, sock, key, deadline));
+                peers.extend(
+                    join_all(more)
+                        .await
+                        .into_iter()
+                        .flat_map(|outcome| outcome.peers)
+                        .filter(|peer| seen.insert(*peer)),
+                );
+            }
+        }
+        peers
     }
 
     /// Announces that we are a peer for `key` on `port` (TCP), on every
@@ -273,10 +339,28 @@ impl Dht {
         let announces = routed
             .iter()
             .map(|sock| lookup::announce(&self.inner, sock, key, port, deadline));
-        join_all(announces)
+        let primary: usize = join_all(announces)
             .await
             .into_iter()
-            .fold(0, usize::saturating_add)
+            .fold(0, usize::saturating_add);
+        if primary > 0 {
+            return primary;
+        }
+        // Fallback fan-out: the closest socket accepted nothing, so try the
+        // remaining identities (closest first per family).
+        let fallback = fallback_sockets(&self.inner, &target);
+        if fallback.is_empty() {
+            return primary;
+        }
+        let more = fallback
+            .iter()
+            .map(|sock| lookup::announce(&self.inner, sock, key, port, deadline));
+        primary.saturating_add(
+            join_all(more)
+                .await
+                .into_iter()
+                .fold(0, usize::saturating_add),
+        )
     }
 
     /// BEP 33 scrape for `key` on every address family: iterative
@@ -297,6 +381,19 @@ impl Dht {
         for outcome in join_all(lookups).await {
             report.merge_outcome(outcome);
         }
+        // Fallback fan-out: the closest socket learned nothing (no peers,
+        // no aware responses), so try the remaining identities.
+        if report.peers.is_empty() && report.aware == 0 {
+            let fallback = fallback_sockets(&self.inner, &target);
+            if !fallback.is_empty() {
+                let more = fallback
+                    .iter()
+                    .map(|sock| lookup::scrape(&self.inner, sock, key, deadline));
+                for outcome in join_all(more).await {
+                    report.merge_outcome(outcome);
+                }
+            }
+        }
         report
     }
 
@@ -315,6 +412,19 @@ impl Dht {
         let mut report = ScrapeReport::default();
         for outcome in join_all(lookups).await {
             report.merge_outcome(outcome);
+        }
+        // Fallback fan-out, as in `scrape`: the closest socket learned
+        // nothing, so try the remaining identities.
+        if report.peers.is_empty() && report.aware == 0 {
+            let fallback = fallback_sockets(&self.inner, &target);
+            if !fallback.is_empty() {
+                let more = fallback
+                    .iter()
+                    .map(|sock| lookup::scrape_fetch(&self.inner, sock, key, deadline));
+                for outcome in join_all(more).await {
+                    report.merge_outcome(outcome);
+                }
+            }
         }
         report
     }
@@ -336,6 +446,7 @@ impl Dht {
         let mut report = ScrapeReport::default();
         let target = NodeId::from(key);
         let routed = route_sockets(&self.inner, &target);
+        let fallback = fallback_sockets(&self.inner, &target);
         for sock in routed.iter().filter(|s| s.family == Family::V4) {
             if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
                 break;
@@ -345,11 +456,32 @@ impl Dht {
         if report.is_live(threshold) {
             return report;
         }
+        // Fallback fan-out, gated like `scrape`: only when the closest
+        // socket learned nothing (no peers, no aware responses).
+        if report.peers.is_empty() && report.aware == 0 {
+            for sock in fallback.iter().filter(|s| s.family == Family::V4) {
+                if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
+                    break;
+                }
+                report.merge_outcome(lookup::scrape(&self.inner, sock, key, deadline).await);
+            }
+            if report.is_live(threshold) {
+                return report;
+            }
+        }
         for sock in routed.iter().filter(|s| s.family == Family::V6) {
             if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
                 break;
             }
             report.merge_outcome(lookup::scrape(&self.inner, sock, key, deadline).await);
+        }
+        if report.peers.is_empty() && report.aware == 0 {
+            for sock in fallback.iter().filter(|s| s.family == Family::V6) {
+                if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
+                    break;
+                }
+                report.merge_outcome(lookup::scrape(&self.inner, sock, key, deadline).await);
+            }
         }
         report
     }
@@ -359,10 +491,12 @@ impl Dht {
         self.inner.stats()
     }
 
-    /// Records a sighting of life for sampler live-probing:
-    /// call with peers of successful fetches and connected hint peers. The
-    /// sampler spends `sampler_live_share` of picks querying these addrs
-    /// directly; dead ones are evicted after consecutive failures.
+    /// Records a sighting of life for sampler live-probing: call with any
+    /// peer whose TCP dial connected — including hint peers that connected
+    /// but failed later — and with peers of successful fetches (subsumed:
+    /// a success connected by definition). The sampler spends
+    /// `sampler_live_share` of picks querying these addrs directly; dead
+    /// ones are evicted after consecutive failures.
     pub fn note_live_addr(&self, addr: SocketAddr) {
         self.inner.offer_live(addr);
     }
@@ -504,5 +638,32 @@ mod route_tests {
             closest_per_family(&[(Family::V4, near_v4)], &target),
             vec![0]
         );
+    }
+
+    #[test]
+    fn fallback_covers_the_non_closest_identities_closest_first() {
+        let target = NodeId([0x80; 20]);
+        let near_v4 = NodeId([0x80; 20]);
+        let mid_v4 = NodeId([0x81; 20]);
+        let far_v4 = NodeId([0x00; 20]);
+        let v6 = NodeId([0xFF; 20]);
+        let ids = vec![
+            (Family::V4, far_v4),
+            (Family::V4, near_v4),
+            (Family::V4, mid_v4),
+            (Family::V6, v6),
+        ];
+        let primary = closest_per_family(&ids, &target);
+        assert_eq!(primary, vec![1, 3]);
+        // The failed closest V4 falls back to the remaining V4 identities,
+        // closest first; the lone V6 has no fallback.
+        assert_eq!(fallback_per_family(&ids, &target, &primary), vec![2, 0]);
+        // A failed V6-only primary still leaves the V4 fallback ordered.
+        assert_eq!(fallback_per_family(&ids, &target, &[3]), vec![1, 2, 0]);
+        // One identity per family: nothing to fall back to.
+        let single = vec![(Family::V4, near_v4), (Family::V6, v6)];
+        let primary = closest_per_family(&single, &target);
+        assert!(fallback_per_family(&single, &target, &primary).is_empty());
+        assert!(fallback_per_family(&[], &target, &[]).is_empty());
     }
 }

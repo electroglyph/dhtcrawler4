@@ -31,7 +31,7 @@ use dc4_core::DhtKey;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
-pub use fetch::fetch_metadata;
+pub use fetch::{fetch_metadata, fetch_metadata_with_hook};
 
 /// Default TCP connect timeout.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);

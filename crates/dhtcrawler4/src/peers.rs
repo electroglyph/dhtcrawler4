@@ -39,9 +39,13 @@ pub trait PeerSource: Clone + Send + Sync + 'static {
     fn own_ips(&self) -> Vec<IpAddr>;
     /// Our own bound socket addresses.
     fn own_endpoints(&self) -> Vec<SocketAddr>;
-    /// Records a sighting of life for sampler live-probing:
-    /// the sampler spends `sampler_live_share` of picks querying these
-    /// addrs directly. Default is a no-op so test doubles are unaffected.
+    /// Records a sighting of life for sampler live-probing: call with
+    /// peers of successful fetches and with any peer whose TCP dial
+    /// connected — including hint peers that connected but failed later
+    /// (a connect already proves the addr is live, even without
+    /// metadata). The sampler spends `sampler_live_share` of picks
+    /// querying these addrs directly. Default is a no-op so test doubles
+    /// are unaffected.
     fn note_live_addr(&self, _addr: SocketAddr) {}
 }
 
@@ -62,8 +66,7 @@ impl PeerSource for dc4_dht::Dht {
         async move {
             let start = std::time::Instant::now();
             let report = dc4_dht::Dht::scrape_fetch(self, key, timeout).await;
-            metrics::histogram!(METRIC_LOOKUP_DURATION, "kind" => "fetch")
-                .record(start.elapsed());
+            metrics::histogram!(METRIC_LOOKUP_DURATION, "kind" => "fetch").record(start.elapsed());
             report
         }
     }
@@ -177,8 +180,15 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_keys_on_endpoints() {
-        let f = PeerFilter {
+    fn lookup_duration_metric_name_is_stable() {
+        // WS1: dashboards alert on this histogram, labeled `kind` =
+        // `fetch` (see `scrape_peers`) or `scrape` (see `scrape.rs`).
+        // A rename would silently break those dashboards.
+        assert_eq!(METRIC_LOOKUP_DURATION, "dc4_lookup_duration_seconds");
+    }
+
+    #[test]
+    fn test_filter_keys_on_endpoints() {        let f = PeerFilter {
             allow_private: true,
             by_endpoint: true,
         };

@@ -761,6 +761,7 @@ version = "0.7.0"
 dependencies = [
  "dc4-core",
  "lru 0.18.5",
+ "metrics",
  "proptest",
  "rand 0.9.5",
  "tempfile",

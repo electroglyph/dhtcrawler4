@@ -74,9 +74,9 @@ pub fn parse_list(text: &str) -> (Vec<TrackerEntry>, usize, usize) {
 
 /// Fetches list text over plain HTTP. `https://` is rejected: no TLS here.
 pub async fn fetch_list(url: &str, timeout: Duration) -> Result<String, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "tracker list refresh needs plain http (no TLS client); keeping the last set".to_owned())?;
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        "tracker list refresh needs plain http (no TLS client); keeping the last set".to_owned()
+    })?;
     let (hostport, path) = match rest.find('/').map(|i| rest.split_at(i)) {
         Some((h, p)) => (h, p),
         None => (rest, "/"),
@@ -161,7 +161,10 @@ mod tests {
         let err = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(fetch_list("https://example.com/list.txt", Duration::from_secs(1)));
+            .block_on(fetch_list(
+                "https://example.com/list.txt",
+                Duration::from_secs(1),
+            ));
         assert!(err.is_err());
     }
 
@@ -185,5 +188,12 @@ mod tests {
         let text = fetch_list(&url, Duration::from_secs(5)).await.unwrap();
         let (entries, _, _) = parse_list(&text);
         assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_refresh_failure_is_an_error_for_caller_to_ignore() {
+        // A closed port must fail fast so run_refresh can keep the last set.
+        let err = fetch_list("http://127.0.0.1:9/list.txt", Duration::from_millis(300)).await;
+        assert!(err.is_err());
     }
 }

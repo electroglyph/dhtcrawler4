@@ -4,6 +4,32 @@
 //! Each flush is scraped at a random subset of live trackers; keys with
 //! seeders land in the announce stage, the rest stay DHT-only. Announce
 //! results merge into the fetch dial queue like any other peers.
+//!
+//! Privacy/abuse: announces expose our IP per hash to tracker operators
+//! (same exposure class as DHT participation). Good-citizen subset:
+//! `started`-only one-shots, a random subset of live trackers per key
+//! (never the whole list), per-(key,tracker) re-announce floors honoring
+//! each tracker's announce-response `interval` (`max(interval, 60s)` —
+//! UDP has no `min interval`, only `interval`; scrape responses carry
+//! none), liveness probes ~1 packet/server/hour. Re-announce only when a
+//! tracker returned zero peers and the cooldown elapsed: keys that
+//! already yielded peers are not re-announced.
+//!
+//! Metric cardinality: per-tracker labels are bounded — explicit
+//! `trackers` validate to <= 32 entries and the vendored list holds 17
+//! usable UDP entries — so `tracker`-labeled series stay small. See
+//! [`METRIC_CONN_REFRESH`].
+//!
+//! Deviations from the hybrid spec, documented not hidden:
+//! - No dedicated 32-task announce pool: announces run inline on fetch
+//!   workers, throttled by the shared [`PacketBudget`] plus a 32-permit
+//!   semaphore ([`ANNOUNCE_CONCURRENCY`]), so at most 32 announces run
+//!   at once without extra tasks.
+//! - `tracker_list_url` defaults to `""` (refresh off): the tree has no
+//!   TLS client (plain HTTP only), so the spec's `https://` default URL
+//!   cannot be fetched — set an `http://` URL to enable refresh.
+//! - Selection uses one OS-seeded RNG per pool (see `TrackerPool`), not
+//!   per key.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,6 +38,7 @@ use std::time::{Duration, Instant};
 use dc4_core::DhtKey;
 use dc4_tracker::{LiveServer, TrackerPool, parse_list};
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CrawlConfig;
@@ -20,6 +47,9 @@ use crate::stores::CrawlStore;
 const BATCH_KEYS: usize = dc4_tracker::MAX_SCRAPE_HASHES;
 const BATCH_WINDOW: Duration = Duration::from_millis(200);
 const SWEEP_SECS: u64 = 3_600;
+/// Max concurrent announces: the spec's ~32 worker pool, implemented as
+/// a semaphore around inline announces (no dedicated tasks).
+const ANNOUNCE_CONCURRENCY: usize = dc4_tracker::ANNOUNCE_CONCURRENCY;
 
 pub const METRIC_ANNOUNCES: &str = "dc4_tracker_announces_total";
 pub const METRIC_PEERS: &str = "dc4_tracker_peers_total";
@@ -29,6 +59,10 @@ pub const METRIC_SCRAPED_KEYS: &str = "dc4_tracker_scraped_keys_total";
 pub const METRIC_SEED_HITS: &str = "dc4_tracker_seed_hits_total";
 pub const METRIC_LIST_REFRESH: &str = "dc4_tracker_list_refresh_total";
 pub const METRIC_LIST_SERVERS: &str = "dc4_tracker_list_servers";
+/// Connection-ID refreshes by tracker and reason (`expiry`|`invalid`),
+/// emitted by the pool. Per-tracker cardinality is bounded (<= 32
+/// servers; see the module docs).
+pub const METRIC_CONN_REFRESH: &str = dc4_tracker::METRIC_CONN_REFRESH;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -102,7 +136,8 @@ impl PacketBudget {
                 let mut state = lock(&self.state);
                 let now = Instant::now();
                 let (tokens, last) = &mut *state;
-                *tokens = (*tokens + now.saturating_duration_since(*last).as_secs_f64() * self.rate)
+                *tokens = (*tokens
+                    + now.saturating_duration_since(*last).as_secs_f64() * self.rate)
                     .min(self.rate);
                 *last = now;
                 if *tokens >= need {
@@ -127,8 +162,20 @@ struct Pending {
     tx: oneshot::Sender<Option<u32>>,
 }
 
-struct BatchState {
+/// Scrape batcher: collects claimed keys and flushes at 74 keys
+/// ([`BATCH_KEYS`] = one datagram) or every ~200 ms ([`BATCH_WINDOW`]),
+/// whichever comes first. Whoever fills the batch or times out flushes
+/// it; every pending key gets its verdict, so no key is left behind.
+struct ScrapeBatcher {
     pending: Vec<Pending>,
+}
+
+impl ScrapeBatcher {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
 }
 
 /// The crawl role's handle: pool, batcher, budget, store. `None` in the
@@ -137,17 +184,15 @@ pub struct TrackerHandle<S> {
     pool: Arc<TrackerPool>,
     tuning: TrackerConfig,
     budget: PacketBudget,
-    batch: Mutex<BatchState>,
+    batch: Mutex<ScrapeBatcher>,
+    announce_sem: Arc<Semaphore>,
     store: S,
 }
 
 impl<S: CrawlStore> TrackerHandle<S> {
     /// Starts the pool on the vendored snapshot plus any explicit `trackers`
     /// (which replace, not merge). Returns `None` when disabled.
-    pub async fn start(
-        c: &TrackerConfig,
-        store: S,
-    ) -> Option<Arc<Self>> {
+    pub async fn start(c: &TrackerConfig, store: S) -> Option<Arc<Self>> {
         if !c.enabled {
             return None;
         }
@@ -171,13 +216,15 @@ impl<S: CrawlStore> TrackerHandle<S> {
             live = pool.live_count(),
             "tracker pool started"
         );
+        metrics::gauge!(METRIC_LIST_SERVERS, "state" => "live").set(pool.live_count() as f64);
+        metrics::gauge!(METRIC_LIST_SERVERS, "state" => "dead")
+            .set(pool.known_count().saturating_sub(pool.live_count()) as f64);
         Some(Arc::new(Self {
             pool,
             tuning,
             budget: PacketBudget::new(c.packets_per_sec),
-            batch: Mutex::new(BatchState {
-                pending: Vec::new(),
-            }),
+            batch: Mutex::new(ScrapeBatcher::new()),
+            announce_sem: Arc::new(Semaphore::new(ANNOUNCE_CONCURRENCY)),
             store,
         }))
     }
@@ -201,7 +248,10 @@ impl<S: CrawlStore> TrackerHandle<S> {
         if !full {
             // Someone else's flush usually resolves this first; on timeout
             // take the batch and flush it ourselves (or find it done).
-            let wait = BATCH_WINDOW + self.tuning.timeout * 2 + Duration::from_secs(1);
+            // Wait only the batch window: the flush itself (budget +
+            // scrape) happens after, so a low-rate single key pays ~200ms,
+            // not the scrape timeout on top.
+            let wait = BATCH_WINDOW;
             tokio::select! {
                 v = &mut rx => return v.unwrap_or(None),
                 () = tokio::time::sleep(wait) => {}
@@ -221,10 +271,18 @@ impl<S: CrawlStore> TrackerHandle<S> {
         let keys: Vec<DhtKey> = pending.iter().map(|p| p.key).collect();
         let servers: Vec<LiveServer> = self.pool.pick_live(self.tuning.scrape_fanout as usize);
         if servers.is_empty() {
+            // Live set drained between triage entry and flush: resolve
+            // every key DHT-only explicitly so no oneshot is left behind
+            // and the fallback is counted like the triage-entry path.
+            metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "no_live")
+                .increment(pending.len() as u64);
+            for p in pending {
+                let _ = p.tx.send(None);
+            }
             return;
         }
         self.budget.acquire(servers.len()).await;
-        let (seeders, outcomes) = self.pool.scrape(&servers, &keys).await;
+        let (seeders, outcomes, per_server) = self.pool.scrape(&servers, &keys).await;
         for (label, ok) in &outcomes {
             metrics::counter!(METRIC_SCRAPES, "tracker" => label.clone()).increment(1);
             if *ok {
@@ -234,11 +292,14 @@ impl<S: CrawlStore> TrackerHandle<S> {
                 metrics::counter!(METRIC_TIMEOUTS).increment(1);
             }
         }
+        for (label, seeds) in &per_server {
+            let hits = seeds.values().filter(|s| **s > 0).count() as u64;
+            if hits > 0 {
+                metrics::counter!(METRIC_SEED_HITS, "tracker" => label.clone()).increment(hits);
+            }
+        }
         for p in pending {
             let verdict = seeders.get(&p.key).copied();
-            if verdict.is_some_and(|s| s > 0) {
-                metrics::counter!(METRIC_SEED_HITS).increment(1);
-            }
             if let Some(s) = verdict
                 && let Err(e) = self.store.note_fetch_estimate(&p.key, s).await
             {
@@ -249,23 +310,44 @@ impl<S: CrawlStore> TrackerHandle<S> {
     }
 
     /// Announces a triage-positive key: unioned tracker peers. Empty when
-    /// floored, peerless, or unanswered.
+    /// floored, peerless, or unanswered. Skips keys that already yielded
+    /// peers (harvested into the dial queue — re-announcing wastes
+    /// packets) and filters per-tracker floored candidates so a retry can
+    /// try unfloored trackers while floored ones cool down.
     pub async fn announce_peers(&self, key: DhtKey) -> Vec<SocketAddr> {
-        if self.pool.announced_recently(&key, Instant::now()) {
+        let now = Instant::now();
+        if self.pool.last_had_peers(&key) {
             metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "floored")
                 .increment(1);
             return Vec::new();
         }
-        let servers = self
-            .pool
-            .pick_live(self.tuning.announces_per_key as usize);
+        if self.pool.announced_recently(&key, now) {
+            metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "floored")
+                .increment(1);
+            return Vec::new();
+        }
+        let servers = self.pool.pick_live(self.tuning.announces_per_key as usize);
         if servers.is_empty() {
             metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "no_live")
                 .increment(1);
             return Vec::new();
         }
-        self.budget.acquire(servers.len() * 2).await;
-        let out = self.pool.announce(&servers, &key).await;
+        let live: Vec<LiveServer> = servers
+            .into_iter()
+            .filter(|s| !self.pool.tracker_floored(&key, &s.label, now))
+            .collect();
+        if live.is_empty() {
+            metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "floored")
+                .increment(1);
+            return Vec::new();
+        }
+        // Bound concurrent announces pool-wide (spec's ~32 worker pool).
+        let sem = self.announce_sem.clone();
+        let Ok(_permit) = sem.acquire_owned().await else {
+            return Vec::new();
+        };
+        self.budget.acquire(live.len() * 2).await;
+        let out = self.pool.announce(&live, &key).await;
         for (label, ok) in &out.server_ok {
             metrics::counter!(
                 METRIC_ANNOUNCES,
@@ -343,5 +425,160 @@ impl<S: CrawlStore> TrackerHandle<S> {
         let known = self.pool.known_count() as f64;
         metrics::gauge!(METRIC_LIST_SERVERS, "state" => "live").set(live);
         metrics::gauge!(METRIC_LIST_SERVERS, "state" => "dead").set(known - live);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memstore::MemoryStore;
+
+    /// Minimal UDP tracker: connect handshakes, scrape reports `seeders`
+    /// for every key, announce returns one peer.
+    async fn mock_tracker(seeders: u32, peer: SocketAddr) -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut conn_id = 0x5500u64;
+            loop {
+                let (len, from) = sock.recv_from(&mut buf).await.unwrap();
+                if len < 16 {
+                    continue;
+                }
+                let action = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                let txn = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                match action {
+                    0 => {
+                        conn_id += 1;
+                        let mut r = vec![0u8; 16];
+                        r[0..4].copy_from_slice(&0u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        r[8..16].copy_from_slice(&conn_id.to_be_bytes());
+                        sock.send_to(&r, from).await.unwrap();
+                    }
+                    2 => {
+                        let n = (len - 16) / 20;
+                        let mut r = vec![0u8; 8 + 12 * n];
+                        r[0..4].copy_from_slice(&2u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        for i in 0..n {
+                            r[8 + 12 * i..12 + 12 * i]
+                                .copy_from_slice(&seeders.to_be_bytes());
+                        }
+                        sock.send_to(&r, from).await.unwrap();
+                    }
+                    1 => {
+                        let mut r = vec![0u8; 20 + 6];
+                        r[0..4].copy_from_slice(&1u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        r[8..12].copy_from_slice(&60u32.to_be_bytes());
+                        match peer {
+                            SocketAddr::V4(v4) => {
+                                r[20..24].copy_from_slice(&v4.ip().octets());
+                                r[24..26].copy_from_slice(&v4.port().to_be_bytes());
+                            }
+                            SocketAddr::V6(_) => continue,
+                        }
+                        sock.send_to(&r, from).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        addr
+    }
+
+    fn handle_config(mock: SocketAddr) -> TrackerConfig {
+        TrackerConfig {
+            enabled: true,
+            trackers: vec![format!("udp://{}:{}", mock.ip(), mock.port())],
+            timeout: Duration::from_secs(2),
+            ..TrackerConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_starts_no_pool() {
+        let store = MemoryStore::new();
+        let h = TrackerHandle::start(&TrackerConfig::default(), store).await;
+        assert!(h.is_none(), "enabled=false must yield no pool/sockets");
+    }
+
+    #[tokio::test]
+    async fn explicit_trackers_replace_the_vendored_list() {
+        let store = MemoryStore::new();
+        let cfg = TrackerConfig {
+            enabled: true,
+            trackers: vec!["udp://127.0.0.1:9".to_owned()],
+            timeout: Duration::from_secs(2),
+            ..TrackerConfig::default()
+        };
+        let h = TrackerHandle::start(&cfg, store).await.unwrap();
+        assert_eq!(
+            h.pool.known_count(),
+            1,
+            "one explicit entry replaces the 17-entry vendored list"
+        );
+    }
+
+    #[tokio::test]
+    async fn batcher_timeout_flushes_a_lonely_key() {
+        let peer: SocketAddr = "10.9.0.1:6881".parse().unwrap();
+        let mock = mock_tracker(4, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        let key = DhtKey([77; 20]);
+        let verdict = tokio::time::timeout(Duration::from_secs(10), h.triage(key))
+            .await
+            .expect("single key must flush on timeout, not hang");
+        assert_eq!(verdict, Some(4), "no key left behind on the timeout path");
+    }
+
+    #[tokio::test]
+    async fn flush_with_drained_live_set_resolves_none() {
+        let peer: SocketAddr = "10.9.0.2:6881".parse().unwrap();
+        let mock = mock_tracker(4, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        // Drain the optimistic live set between triage entry and flush.
+        h.pool.clear_live_for_test();
+        let key = DhtKey([78; 20]);
+        let verdict = tokio::time::timeout(Duration::from_secs(10), h.triage(key))
+            .await
+            .expect("drained live set must still resolve");
+        assert_eq!(verdict, None, "empty-servers flush resolves DHT-only");
+    }
+
+    #[tokio::test]
+    async fn announce_skips_keys_that_already_yielded_peers() {
+        let peer: SocketAddr = "10.9.0.3:6881".parse().unwrap();
+        let mock = mock_tracker(4, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        let key = DhtKey([79; 20]);
+        let first = h.announce_peers(key).await;
+        assert_eq!(first, vec![peer]);
+        let second = h.announce_peers(key).await;
+        assert!(
+            second.is_empty(),
+            "peer-yielding keys are not re-announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_zero_seeders_means_dht_only_but_still_a_verdict() {
+        let peer: SocketAddr = "10.9.0.4:6881".parse().unwrap();
+        let mock = mock_tracker(0, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        let verdict = tokio::time::timeout(Duration::from_secs(10), h.triage(DhtKey([80; 20])))
+            .await
+            .expect("zero-seeder batch must still resolve");
+        assert_eq!(verdict, Some(0), "zero seeders is a verdict (DHT-only)");
     }
 }

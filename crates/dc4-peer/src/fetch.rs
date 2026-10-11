@@ -32,7 +32,24 @@ pub async fn fetch_metadata(
     key: DhtKey,
     limits: &FetchLimits,
 ) -> Result<Vec<u8>, FetchError> {
-    let result = match tokio::time::timeout(limits.total, fetch_inner(peer, key, limits)).await {
+    fetch_metadata_with_hook(peer, key, limits, || {}).await
+}
+
+/// [`fetch_metadata`] with a hook run once the TCP connect succeeds, before
+/// the handshake. The fetch worker feeds the sampler's live ring here so a
+/// hint peer that connected but fails later still counts as live.
+pub async fn fetch_metadata_with_hook(
+    peer: SocketAddr,
+    key: DhtKey,
+    limits: &FetchLimits,
+    on_connect: impl FnOnce() + Send,
+) -> Result<Vec<u8>, FetchError> {
+    let result = match tokio::time::timeout(
+        limits.total,
+        fetch_inner(peer, key, limits, on_connect),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(_) => Err(FetchError::Timeout),
     };
@@ -72,12 +89,14 @@ async fn fetch_inner(
     peer: SocketAddr,
     key: DhtKey,
     limits: &FetchLimits,
+    on_connect: impl FnOnce() + Send,
 ) -> Result<Vec<u8>, FetchError> {
     let stream = match tokio::time::timeout(limits.connect, TcpStream::connect(peer)).await {
         Err(_) => return Err(FetchError::Timeout),
         Ok(Err(e)) => return Err(FetchError::Connect(e.kind())),
         Ok(Ok(s)) => s,
     };
+    on_connect();
     // Best effort: requests are small and latency-sensitive.
     let _ = stream.set_nodelay(true);
     // If the addition overflows, only the total deadline applies.

@@ -122,7 +122,7 @@ pub(crate) struct SocketNode {
     refreshes_running: AtomicUsize,
 }
 
-/// State shared by both sockets.
+/// State shared by all sockets.
 pub(crate) struct Shared {
     pub(crate) tokens: TokenSecrets,
     pub(crate) store: PeerStore,
@@ -226,7 +226,9 @@ fn bind_sockets(cfg: &DhtConfig) -> Result<Vec<Bound>, Error> {
             addr.port().wrapping_add(i as u16)
         };
         let addr = SocketAddr::new(addr.ip(), port);
-        match net::bind_udp(addr).and_then(|socket| socket.local_addr().map(|local| (socket, local))) {
+        match net::bind_udp(addr)
+            .and_then(|socket| socket.local_addr().map(|local| (socket, local)))
+        {
             Ok((socket, local)) => out.push((Family::V6, socket, local)),
             Err(source) if out.is_empty() => return Err(Error::Bind { addr, source }),
             Err(e) => {
@@ -359,9 +361,7 @@ impl Inner {
             .into_iter()
             .map(|b| {
                 let index = next_index.entry(b.0).or_insert(0);
-                let saved = saved
-                    .as_ref()
-                    .and_then(|s| s.identities(b.0).get(*index));
+                let saved = saved.as_ref().and_then(|s| s.identities(b.0).get(*index));
                 *index += 1;
                 Arc::new(SocketNode::new(
                     b,
@@ -1558,13 +1558,9 @@ impl Inner {
             };
             let family = stats.family_mut(sock.family);
             family.enabled = true;
-            family.routing_nodes = family
-                .routing_nodes
-                .saturating_add(routing_nodes);
+            family.routing_nodes = family.routing_nodes.saturating_add(routing_nodes);
             family.good_nodes = family.good_nodes.saturating_add(good_nodes);
-            family.pending_queries = family
-                .pending_queries
-                .saturating_add(pending_queries);
+            family.pending_queries = family.pending_queries.saturating_add(pending_queries);
             if let Some(sampler) = &self.sampler {
                 (family.sampler_frontier, family.sampler_visited) = sampler.sizes(sock.family);
             }
@@ -1878,7 +1874,120 @@ mod tests {
         assert!(known.contains(&addr(4)));
         assert_eq!(known.len(), 4);
     }
-}
+
+    #[tokio::test]
+    async fn fetch_budget_is_dedicated_at_node_level() {
+        // WS1, node level: `query_fetch` charges `fetch_budget`,
+        // `query_scrape` charges `scrape_budget` (shared per-address
+        // spacing). Draining one bucket on a live `Inner` must leave the
+        // other acquirable. Small budgets keep the drain instant, so no
+        // refill lands mid-test (100 ms emission at 10/s).
+        async fn node_with(scrape: u32, fetch: u32) -> Arc<Inner> {
+            let mut cfg = DhtConfig::default();
+            cfg.bind_v4 = Some("127.0.0.1:0".parse().unwrap());
+            cfg.bind_v6 = None;
+            cfg.allow_private_addrs = true;
+            cfg.tuning.limits_by_endpoint = true;
+            cfg.scrape_packets_per_sec = scrape;
+            cfg.fetch_packets_per_sec = fetch;
+            let (tx, _rx) = mpsc::channel(1);
+            Arc::new(Inner::new(cfg, tx).await.unwrap())
+        }
+        // A drained scrape bucket still leaves fetches acquirable (and the
+        // drained bucket itself fails fast with no wait).
+        let inner = node_with(10, 10).await;
+        let now = Instant::now();
+        {
+            let mut budget = lock(&inner.scrape_budget);
+            let mut n = 0;
+            while budget.try_acquire(now) {
+                n += 1;
+            }
+            assert_eq!(n, 10);
+            assert!(!budget.try_acquire(now));
+        }
+        assert!(!inner.acquire_scrape_budget(Duration::ZERO).await);
+        assert!(inner.acquire_fetch_budget(Duration::ZERO).await);
+        // And vice versa on a fresh node: a drained fetch bucket leaves
+        // scrapes acquirable.
+        let inner = node_with(10, 10).await;
+        let now = Instant::now();
+        {
+            let mut budget = lock(&inner.fetch_budget);
+            let mut n = 0;
+            while budget.try_acquire(now) {
+                n += 1;
+            }
+            assert_eq!(n, 10);
+            assert!(!budget.try_acquire(now));
+        }
+        assert!(!inner.acquire_fetch_budget(Duration::ZERO).await);
+        assert!(inner.acquire_scrape_budget(Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn query_paths_charge_their_own_budget() {
+        // WS1, query level: a drained fetch bucket must throttle
+        // `query_fetch` fast (no packet sent), while `query_scrape` on the
+        // same node still gets past its budget check — and vice versa.
+        // This pins the `query_*` -> bucket wiring, not just bucket
+        // independence.
+        async fn node_with(scrape: u32, fetch: u32) -> Arc<Inner> {
+            let mut cfg = DhtConfig::default();
+            cfg.bind_v4 = Some("127.0.0.1:0".parse().unwrap());
+            cfg.bind_v6 = None;
+            cfg.allow_private_addrs = true;
+            cfg.tuning.limits_by_endpoint = true;
+            cfg.scrape_packets_per_sec = scrape;
+            cfg.fetch_packets_per_sec = fetch;
+            // Cross-direction calls miss (TEST-NET target) and must fail
+            // fast on timeout, not hang the test. A 1 ms send-wait keeps
+            // the drained direction throttled (no refill can land in 1 ms)
+            // while a full bucket still acquires instantly.
+            cfg.tuning.query_timeout = Duration::from_millis(50);
+            cfg.tuning.scrape_query_timeout = Duration::from_millis(50);
+            cfg.tuning.max_send_wait = Duration::from_millis(1);
+            let (tx, _rx) = mpsc::channel(1);
+            Arc::new(Inner::new(cfg, tx).await.unwrap())
+        }
+        async fn drain(bucket: &Mutex<TokenBucket>) {
+            let now = Instant::now();
+            let mut b = lock(bucket);
+            while b.try_acquire(now) {}
+        }
+        let ping = || Method::Ping;
+        // Drained fetch: fetch throttles fast, scrape sails past its own
+        // (full) budget and only then misses on the network. Distinct
+        // targets per call: per-address spacing would otherwise throttle
+        // the second query to the same address.
+        let inner = node_with(10, 10).await;
+        drain(&inner.fetch_budget).await;
+        let sock = inner.socket(Family::V4).unwrap().clone();
+        let r = inner.query_fetch(&sock, addr(9), ping(), None).await;
+        assert!(
+            matches!(r, Err(QueryError::Throttled)),
+            "drained fetch budget must throttle query_fetch, got {r:?}"
+        );
+        let r = inner.query_scrape(&sock, addr(10), ping(), None).await;
+        assert!(
+            !matches!(r, Err(QueryError::Throttled)),
+            "full scrape budget must let query_scrape past, got {r:?}"
+        );
+        // Drained scrape: mirror image.
+        let inner = node_with(10, 10).await;
+        drain(&inner.scrape_budget).await;
+        let sock = inner.socket(Family::V4).unwrap().clone();
+        let r = inner.query_scrape(&sock, addr(9), ping(), None).await;
+        assert!(
+            matches!(r, Err(QueryError::Throttled)),
+            "drained scrape budget must throttle query_scrape, got {r:?}"
+        );
+        let r = inner.query_fetch(&sock, addr(10), ping(), None).await;
+        assert!(
+            !matches!(r, Err(QueryError::Throttled)),
+            "full fetch budget must let query_fetch past, got {r:?}"
+        );
+    }
 
     #[tokio::test]
     async fn bind_sockets_gives_each_identity_its_own_port() {
@@ -1904,3 +2013,42 @@ mod tests {
         let bound = bind_sockets(&cfg).unwrap();
         assert_eq!(bound.len(), 1);
     }
+
+    #[tokio::test]
+    async fn bind_sockets_conflict_is_a_clear_bind_error() {
+        // Occupy a real port, then prove the conflict surfaces as
+        // `Error::Bind` (a clear config error) instead of silently sharing.
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let mut cfg = DhtConfig::default();
+        cfg.bind_v4 = Some(SocketAddr::new("127.0.0.1".parse().unwrap(), port));
+        cfg.bind_v6 = None;
+        cfg.identities = 1;
+        match bind_sockets(&cfg) {
+            Err(Error::Bind { addr, .. }) => assert_eq!(addr.port(), port),
+            other => panic!("expected a Bind error, got {other:?}"),
+        }
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn bind_sockets_second_identity_conflict_is_a_clear_bind_error() {
+        // N=2: the first derived port binds, the second (occupied) must
+        // surface as `Error::Bind` naming that port.
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        // First identity takes the port just below the occupied one, so
+        // identity 0 binds `taken - 1` and identity 1 hits `taken`.
+        let base = taken.wrapping_sub(1);
+        assert_ne!(base, 0, "test needs a non-zero base port");
+        let mut cfg = DhtConfig::default();
+        cfg.bind_v4 = Some(SocketAddr::new("127.0.0.1".parse().unwrap(), base));
+        cfg.bind_v6 = None;
+        cfg.identities = 2;
+        match bind_sockets(&cfg) {
+            Err(Error::Bind { addr, .. }) => assert_eq!(addr.port(), taken),
+            other => panic!("expected a Bind error for identity 1, got {other:?}"),
+        }
+        drop(holder);
+    }
+}
