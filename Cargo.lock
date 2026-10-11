@@ -756,6 +756,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc4-tracker"
+version = "0.7.0"
+dependencies = [
+ "dc4-core",
+ "lru 0.18.5",
+ "proptest",
+ "rand 0.9.5",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dc4-web"
 version = "0.7.0"
 dependencies = [
@@ -805,6 +819,7 @@ dependencies = [
  "dc4-search",
  "dc4-store",
  "dc4-torrent",
+ "dc4-tracker",
  "dc4-web",
  "futures",
  "ipnet",

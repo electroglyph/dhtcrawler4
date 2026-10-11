@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 use crate::admission::{METRIC_HINT_USED, SharedHints, add_hint, take_hints};
 use crate::peers::{OwnAddrs, PeerFilter, PeerSource};
 use crate::stores::CrawlStore;
+use crate::tracker::TrackerHandle;
 
 /// Queue items claimed at a time by one worker.
 pub const CLAIM_BATCH: i64 = 8;
@@ -739,6 +740,7 @@ pub struct Fetcher<S, P> {
     byte_budget: Arc<Semaphore>,
     max_metadata: usize,
     tuning: FetchTuning,
+    tracker: Option<Arc<TrackerHandle<S>>>,
 }
 
 impl<S, P> std::fmt::Debug for Fetcher<S, P> {
@@ -783,6 +785,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
         hints: SharedHints,
         limits: FetchLimitsConfig,
         tuning: FetchTuning,
+        tracker: Option<Arc<TrackerHandle<S>>>,
     ) -> Self {
         let budget_permits = (limits.max_inflight_metadata_bytes / BYTE_BUDGET_UNIT)
             .clamp(1, Semaphore::MAX_PERMITS);
@@ -801,6 +804,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
             byte_budget: Arc::new(Semaphore::new(budget_permits)),
             max_metadata: limits.max_metadata_bytes,
             tuning,
+            tracker,
         }
     }
 
@@ -928,6 +932,18 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
         let mut running = FuturesUnordered::new();
         let mut deferred = Deferred::default();
         let mut progress = 0usize;
+        // Tracker triage runs alongside the DHT lookup: scrape-triage first,
+        // then announces for triage-positive keys only. Announce peers race
+        // with traversal peers — first peers win, the loser is cancelled by
+        // the loop ending. `None` when trackers are off.
+        let mut triage: Option<Pin<Box<dyn Future<Output = Option<u32>> + Send>>> =
+            self.tracker.clone().map(|t| {
+                let fut = async move { t.triage(key).await };
+                Box::pin(fut) as Pin<Box<dyn Future<Output = Option<u32>> + Send>>
+            });
+        let mut announce: Option<
+            Pin<Box<dyn Future<Output = Vec<SocketAddr>> + Send>>,
+        > = None;
         loop {
             if queue.is_empty() {
                 deferred.requeue(&mut queue, progress);
@@ -964,7 +980,11 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                     self.peers.scrape_peers(key, self.tuning.get_peers_timeout),
                 ));
             }
-            if running.is_empty() && (lookup.is_none() || attempts >= max_attempts) {
+            if running.is_empty()
+                && (lookup.is_none() || attempts >= max_attempts)
+                && triage.is_none()
+                && announce.is_none()
+            {
                 break;
             }
             tokio::select! {
@@ -1000,6 +1020,46 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                             // `take` is destructive, so these survive only
                             // for the NEXT `obtain()` — this one already
                             // holds them in `seen`, no double-dial.
+                            add_hint(&self.hints, key, peer, Instant::now());
+                            queue.push_back(peer);
+                        }
+                    }
+                }
+                seeders = async {
+                    if let Some(triage) = triage.as_mut() {
+                        triage.await
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if triage.is_some() => {
+                    triage = None;
+                    progress = progress.saturating_add(1);
+                    // Triage-positive keys go to the announce stage; the
+                    // rest stay DHT-only.
+                    if seeders.is_some_and(|s| s > 0) && announce.is_none() {
+                        if let Some(t) = self.tracker.clone() {
+                            let fut = async move { t.announce_peers(key).await };
+                            announce = Some(
+                                Box::pin(fut)
+                                    as Pin<Box<dyn Future<Output = Vec<SocketAddr>> + Send>>,
+                            );
+                        }
+                    }
+                }
+                tracker_peers = async {
+                    if let Some(announce) = announce.as_mut() {
+                        announce.await
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if announce.is_some() => {
+                    announce = None;
+                    progress = progress.saturating_add(1);
+                    own = OwnAddrs::of(&self.peers);
+                    for peer in tracker_peers {
+                        if let Some(peer) = self.filter.accept(peer, &own)
+                            && seen.insert(peer)
+                        {
                             add_hint(&self.hints, key, peer, Instant::now());
                             queue.push_back(peer);
                         }
@@ -1299,6 +1359,7 @@ mod tests {
     use super::*;
     use crate::admission::{AdmissionTuning, shared_hints};
     use crate::memstore::MemoryStore;
+    use crate::tracker::TrackerConfig;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -1688,6 +1749,7 @@ mod tests {
                 max_inflight_metadata_bytes: 1024 * 1024,
             },
             tuning,
+            None,
         ))
     }
 
@@ -1711,6 +1773,7 @@ mod tests {
                 max_inflight_metadata_bytes: 1024 * 1024,
             },
             tuning,
+            None,
         ))
     }
 
@@ -2219,6 +2282,112 @@ mod tests {
         assert!(hints.lock().unwrap().is_empty());
     }
 
+    /// A mock UDP tracker: connects, scrapes every key at 3 seeders,
+    /// announces one peer (the counting listener).
+    async fn mock_tracker(peer: SocketAddr) -> SocketAddr {
+        use tokio::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((len, from)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                if len < 16 {
+                    continue;
+                }
+                let action = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                let txn = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+                match action {
+                    0 => {
+                        let mut r = vec![0u8; 16];
+                        r[0..4].copy_from_slice(&0u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        r[8..16].copy_from_slice(&0x5555u64.to_be_bytes());
+                        let _ = sock.send_to(&r, from).await;
+                    }
+                    2 => {
+                        let n = (len - 16) / 20;
+                        let mut r = vec![0u8; 8 + 12 * n];
+                        r[0..4].copy_from_slice(&2u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        for i in 0..n {
+                            r[8 + 12 * i..12 + 12 * i].copy_from_slice(&3u32.to_be_bytes());
+                        }
+                        let _ = sock.send_to(&r, from).await;
+                    }
+                    1 => {
+                        let mut r = vec![0u8; 26];
+                        r[0..4].copy_from_slice(&1u32.to_be_bytes());
+                        r[4..8].copy_from_slice(&txn.to_be_bytes());
+                        r[8..12].copy_from_slice(&99u32.to_be_bytes());
+                        let ip = match peer.ip() {
+                            IpAddr::V4(ip) => ip.octets(),
+                            _ => unreachable!(),
+                        };
+                        r[20..24].copy_from_slice(&ip);
+                        r[24..26].copy_from_slice(&peer.port().to_be_bytes());
+                        let _ = sock.send_to(&r, from).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracker_peers_join_the_dial_queue() {
+        // The DHT finds nothing; triage sees 3 seeders; the announce peer
+        // gets dialed. The counting listener accepts then drops, so the
+        // key still fails — but the dial proves tracker peers flow in.
+        let store = MemoryStore::new();
+        let (addr, dials) = counting_listener().await;
+        let tracker_addr = mock_tracker(addr).await;
+        let cfg = TrackerConfig {
+            enabled: true,
+            trackers: vec![format!("udp://127.0.0.1:{}/announce", tracker_addr.port())],
+            timeout: Duration::from_secs(1),
+            ..TrackerConfig::default()
+        };
+        let tracker = TrackerHandle::start(&cfg, store.clone()).await.unwrap();
+        let peers = ScriptedLookups::new(vec![]);
+        let f = Arc::new(Fetcher::new(
+            store.clone(),
+            peers,
+            PeerFilter {
+                allow_private: true,
+                by_endpoint: true,
+            },
+            shared_hints(&AdmissionTuning::default()),
+            FetchLimitsConfig {
+                max_connections: 8,
+                max_metadata_bytes: 1024 * 1024,
+                max_inflight_metadata_bytes: 1024 * 1024,
+            },
+            test_tuning(),
+            Some(tracker),
+        ));
+        let k = DhtKey([55; 20]);
+        assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+        assert!(
+            dials.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "tracker-announced peer was dialed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracker_disabled_is_dht_only() {
+        // No pool, no sockets: a peerless key finds nothing and the triage
+        // path is skipped entirely.
+        let store = MemoryStore::new();
+        let peers = ScriptedLookups::new(vec![]);
+        let f = fetcher(&store, peers);
+        let k = DhtKey([56; 20]);
+        assert!(matches!(f.obtain(k, None).await, Obtained::NoPeers));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn low_estimate_keeps_today_effort() {
         let store = MemoryStore::new();
@@ -2684,6 +2853,7 @@ mod tests {
                 max_inflight_metadata_bytes: 1024 * 1024,
             },
             test_tuning(),
+            None,
         ));
         assert_eq!(f.process(&item(k)).await, FetchOutcome::NoPeers);
 

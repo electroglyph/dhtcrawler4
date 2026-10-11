@@ -37,4 +37,5 @@ pub mod roles;
 pub mod scrape;
 pub mod signals;
 pub mod stores;
+pub mod tracker;
 pub mod web;

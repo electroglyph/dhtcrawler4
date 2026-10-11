@@ -235,6 +235,25 @@ pub struct CrawlConfig {
     pub scrape_node_cache_keys: usize,
     /// Agreeing nonzero responses that end a traversal early (live-only).
     pub scrape_early_exit_quorum: u32,
+    /// False means the tracker pool never starts and fetch is DHT-only.
+    pub tracker_enabled: bool,
+    /// Explicit trackers (`udp://host:port`, one per line or comma
+    /// separated over env). Non-empty replaces the vendored list.
+    pub trackers: Vec<String>,
+    /// Tracker list URL for refresh (plain HTTP only; the tree has no TLS
+    /// client, so `https://` fails logged and keeps the last set). Empty
+    /// disables refresh: vendored snapshot plus explicit list only.
+    pub tracker_list_url: String,
+    /// Seconds between list refreshes.
+    pub tracker_list_refresh_secs: u64,
+    /// Random live trackers announced per triage-positive key.
+    pub tracker_announces_per_key: u32,
+    /// Random live trackers scraped per triage batch.
+    pub tracker_scrape_fanout: u32,
+    /// Pool-wide tracker packet budget.
+    pub tracker_packets_per_sec: u32,
+    /// Per-RPC timeout of tracker queries.
+    pub tracker_timeout_secs: u64,
     /// Pins the BEP 42 `r` value 0-7 for multi-replica deployments, None = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bep42_r: Option<u8>,
@@ -278,6 +297,14 @@ impl Default for CrawlConfig {
             scrape_unknown_interval_secs: 30 * 24 * 60 * 60,
             scrape_node_cache_keys: 4096,
             scrape_early_exit_quorum: 3,
+            tracker_enabled: true,
+            trackers: Vec::new(),
+            tracker_list_url: String::new(),
+            tracker_list_refresh_secs: 86_400,
+            tracker_announces_per_key: 3,
+            tracker_scrape_fanout: 2,
+            tracker_packets_per_sec: 200,
+            tracker_timeout_secs: 5,
             bep42_r: None,
         }
     }
@@ -681,6 +708,26 @@ fn has_control(s: &str) -> bool {
     s.chars().any(char::is_control)
 }
 
+/// One explicit tracker entry: `udp://host:port`, path ignored.
+fn valid_tracker(text: &str) -> Result<(), ConfigError> {
+    let rest = text.trim().strip_prefix("udp://").ok_or_else(|| {
+        invalid(format!("crawl.trackers entry {text:?} must be udp://host:port"))
+    })?;
+    let hostport = rest.split('/').next().unwrap_or("");
+    let (host, port) = hostport.split_once(':').ok_or_else(|| {
+        invalid(format!("crawl.trackers entry {text:?} must be udp://host:port"))
+    })?;
+    let port: u16 = port.trim().parse().map_err(|_| {
+        invalid(format!("crawl.trackers entry {text:?} has a bad port"))
+    })?;
+    if host.trim().is_empty() || port == 0 {
+        return Err(invalid(format!(
+            "crawl.trackers entry {text:?} must be udp://host:port"
+        )));
+    }
+    Ok(())
+}
+
 /// True when two listen addresses would claim the same socket: same port and
 /// equal IPs, a wildcard covering an address of the same family, both
 /// wildcards, or a dual-stack `[::]` wildcard against any same-port IPv4
@@ -932,6 +979,45 @@ impl Config {
             2,
             5,
         )?;
+        if c.trackers.len() > 32 {
+            return Err(invalid("crawl.trackers holds more than 32 entries"));
+        }
+        for t in &c.trackers {
+            valid_tracker(t)?;
+        }
+        if !c.tracker_list_url.trim().is_empty()
+            && !c.tracker_list_url.starts_with("http://")
+            && !c.tracker_list_url.starts_with("https://")
+        {
+            return Err(invalid(
+                "crawl.tracker_list_url must be empty or an http(s) URL",
+            ));
+        }
+        check_range(
+            "crawl.tracker_list_refresh_secs",
+            c.tracker_list_refresh_secs,
+            3_600,
+            604_800,
+        )?;
+        check_range(
+            "crawl.tracker_announces_per_key",
+            c.tracker_announces_per_key,
+            1,
+            8,
+        )?;
+        check_range(
+            "crawl.tracker_scrape_fanout",
+            c.tracker_scrape_fanout,
+            1,
+            4,
+        )?;
+        check_range(
+            "crawl.tracker_packets_per_sec",
+            c.tracker_packets_per_sec,
+            1,
+            1_000,
+        )?;
+        check_range("crawl.tracker_timeout_secs", c.tracker_timeout_secs, 1, 60)?;
         if c.bep42_r.is_some_and(|r| r > 7) {
             return Err(invalid("crawl.bep42_r must be between 0 and 7"));
         }
@@ -1287,6 +1373,8 @@ mod tests {
         assert!(EXAMPLE.contains("sampler_live_share"));
         assert!(EXAMPLE.contains("fetch_packets_per_sec"));
         assert!(EXAMPLE.contains("identities"));
+        assert!(EXAMPLE.contains("tracker_enabled"));
+        assert!(EXAMPLE.contains("tracker_announces_per_key"));
         assert_eq!(
             parsed.web.search_cache_size,
             dc4_web::DEFAULT_SEARCH_CACHE_ENTRIES
@@ -1586,6 +1674,17 @@ mod tests {
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "1.5"),
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "-0.1"),
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "NaN"),
+            ("DC4_CRAWL__TRACKERS", "http://x.example:1/a"),
+            ("DC4_CRAWL__TRACKERS", "udp://x.example:0"),
+            ("DC4_CRAWL__TRACKER_LIST_URL", "ftp://x.example/list"),
+            ("DC4_CRAWL__TRACKER_LIST_REFRESH_SECS", "3599"),
+            ("DC4_CRAWL__TRACKER_ANNOUNCES_PER_KEY", "0"),
+            ("DC4_CRAWL__TRACKER_ANNOUNCES_PER_KEY", "9"),
+            ("DC4_CRAWL__TRACKER_SCRAPE_FANOUT", "0"),
+            ("DC4_CRAWL__TRACKER_SCRAPE_FANOUT", "5"),
+            ("DC4_CRAWL__TRACKER_PACKETS_PER_SEC", "0"),
+            ("DC4_CRAWL__TRACKER_TIMEOUT_SECS", "0"),
+            ("DC4_CRAWL__TRACKER_TIMEOUT_SECS", "61"),
             ("DC4_INDEX__BATCH_SIZE", "1001"),
             ("DC4_INDEX__WRITER_HEAP_BYTES", "1000"),
             ("DC4_INDEX__POLL_INTERVAL_MS", "0"),
@@ -1615,6 +1714,12 @@ mod tests {
         }
         let both_off = with_env(&[("DC4_CRAWL__BIND_V4", ""), ("DC4_CRAWL__BIND_V6", "")]);
         assert!(both_off.is_err());
+        // More than 32 explicit trackers is rejected.
+        let many = (0..33)
+            .map(|i| format!("udp://t{i}.example:80"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(with_env(&[("DC4_CRAWL__TRACKERS", many.as_str())]).is_err());
         // The identity port range must fit in 16 bits.
         let overflow = with_env(&[
             ("DC4_CRAWL__DHT_PORT", "65535"),
@@ -1706,6 +1811,14 @@ mod tests {
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
         assert_eq!(c.identities, 1);
+        assert!(c.tracker_enabled);
+        assert!(c.trackers.is_empty());
+        assert!(c.tracker_list_url.is_empty());
+        assert_eq!(c.tracker_list_refresh_secs, 86_400);
+        assert_eq!(c.tracker_announces_per_key, 3);
+        assert_eq!(c.tracker_scrape_fanout, 2);
+        assert_eq!(c.tracker_packets_per_sec, 200);
+        assert_eq!(c.tracker_timeout_secs, 5);
         assert_eq!(c.removal_cooldown_days, 7);
         assert_eq!(c.tombstone_purge_hours, 1);
         assert_eq!(c.gave_up_purge_hours, 1);

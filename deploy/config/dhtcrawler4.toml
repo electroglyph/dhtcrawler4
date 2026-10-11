@@ -96,6 +96,30 @@ scrape_packets_per_sec = 100
 # alone can never be the binding constraint. Total egress ≈ 6k main + 6k
 # fetch + 100 scrape, near the historic 12k envelope.
 fetch_packets_per_sec = 6000
+# UDP tracker hybrid: scrape triage plus one-shot announces for
+# triage-positive keys. Enabled by default; false means DHT-only fetch and
+# no tracker sockets. Announcements expose our IP per hash to tracker
+# operators (same exposure class as DHT participation): `started`-only, a
+# random subset per key, no hammering.
+tracker_enabled = true
+# Explicit trackers, one per line. Non-empty replaces the vendored list.
+# trackers = [
+#   "udp://tracker.example:6969/announce",
+# ]
+# Tracker list URL for refresh (plain HTTP only: no TLS client, so https
+# fails logged and keeps the last set). Empty disables refresh: vendored
+# snapshot plus explicit list only.
+tracker_list_url = ""
+# Seconds between list refreshes.
+tracker_list_refresh_secs = 86400
+# Random live trackers announced per triage-positive key (canary: 2).
+tracker_announces_per_key = 3
+# Random live trackers scraped per triage batch.
+tracker_scrape_fanout = 2
+# Pool-wide tracker packet budget.
+tracker_packets_per_sec = 200
+# Per-RPC timeout of tracker queries.
+tracker_timeout_secs = 5
 # Base admission cooldown of a removed key, in days; repeats escalate
 # 7 -> 30 -> 90 days (the cap is not a knob).
 removal_cooldown_days = 7

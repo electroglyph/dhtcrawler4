@@ -29,6 +29,7 @@ dc4-peer.workspace = true
 dc4-search.workspace = true
 dc4-store.workspace = true
 dc4-torrent.workspace = true
+dc4-tracker.workspace = true
 dc4-web.workspace = true
 futures.workspace = true
 ipnet.workspace = true

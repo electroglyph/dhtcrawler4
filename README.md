@@ -797,7 +797,7 @@ How to read the output:
   `dc4_blocked_total{reason="peer_address"}` filter drops), and traversal
   peers feeding retries is expected (`dialed` without a matching add means
   retries are working). `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
-  the fetch-budget health signal.
+  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Announces expose our IP per hash to tracker operators, same as DHT participation.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches

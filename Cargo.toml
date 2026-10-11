@@ -8,6 +8,7 @@ members = [
     "crates/dc4-dht",
     "crates/dc4-peer",
     "crates/dc4-store",
+    "crates/dc4-tracker",
     "crates/dc4-search",
     "crates/dc4-web",
     "crates/dhtcrawler4",
@@ -38,6 +39,7 @@ dc4-torrent = { path = "crates/dc4-torrent" }
 dc4-dht = { path = "crates/dc4-dht" }
 dc4-peer = { path = "crates/dc4-peer" }
 dc4-store = { path = "crates/dc4-store" }
+dc4-tracker = { path = "crates/dc4-tracker" }
 dc4-search = { path = "crates/dc4-search" }
 dc4-web = { path = "crates/dc4-web" }
 

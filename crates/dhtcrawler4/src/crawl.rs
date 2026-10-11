@@ -23,6 +23,7 @@ use crate::fetch::{FetchLimitsConfig, FetchTuning, Fetcher, claim_channel};
 use crate::peers::PeerFilter;
 use crate::scrape::{ScrapeTuning, Scraper};
 use crate::stores::CrawlStore;
+use crate::tracker::{TrackerConfig, TrackerHandle};
 
 /// How often DHT counters are exported.
 pub const DHT_STATS_INTERVAL: Duration = Duration::from_secs(5);
@@ -66,6 +67,8 @@ pub struct CrawlOptions {
     /// Good routing nodes needed for readiness.
     pub min_good_nodes: usize,
     pub shutdown_wait: Duration,
+    /// Tracker pool knobs; disabled by default (tests start no pool).
+    pub tracker: TrackerConfig,
 }
 
 impl CrawlOptions {
@@ -96,6 +99,7 @@ impl CrawlOptions {
             readiness_interval: READINESS_INTERVAL,
             min_good_nodes: MIN_GOOD_NODES,
             shutdown_wait: SHUTDOWN_FETCH_WAIT,
+            tracker: TrackerConfig::default(),
         }
     }
 
@@ -139,6 +143,7 @@ impl CrawlOptions {
         opts.scrape = ScrapeTuning::from_config(c);
         opts.scrape_workers = c.scrape_workers;
         opts.admission.removal_cooldown_days = c.removal_cooldown_days;
+        opts.tracker = TrackerConfig::from_config(c);
         Ok(opts)
     }
 }
@@ -181,6 +186,9 @@ impl Crawler {
         let stop = cancel.child_token();
         let hints = shared_hints(&opts.admission);
 
+        // Tracker pool: None when disabled means DHT-only fetch, no sockets.
+        let tracker = TrackerHandle::start(&opts.tracker, store.clone()).await;
+
         let admission = Admission::new(
             store.clone(),
             opts.max_pending,
@@ -199,6 +207,7 @@ impl Crawler {
             hints,
             opts.limits,
             opts.fetch,
+            tracker.clone(),
         ));
         let mut workers = JoinSet::new();
         // One bulk claim per 512 keys instead of one 8-key scan per worker:
@@ -225,6 +234,18 @@ impl Crawler {
             opts.stats_interval,
             stop.clone(),
         ));
+        if let Some(t) = tracker.clone() {
+            let sweep = Arc::clone(&t);
+            aux.spawn(sweep.run_sweep(stop.clone()));
+            if !opts.tracker.list_url.trim().is_empty() {
+                let refresh = Arc::clone(&t);
+                aux.spawn(refresh.run_refresh(
+                    opts.tracker.list_url.clone(),
+                    opts.tracker.list_refresh,
+                    stop.clone(),
+                ));
+            }
+        }
         aux.spawn(export_queue_depth(
             store.clone(),
             opts.queue_depth_interval,
@@ -534,6 +555,9 @@ mod tests {
         );
         assert_eq!(o.dht.tuning.sampler_live_share, 0.10);
         assert_eq!(o.dht.identities, 1);
+        assert!(o.tracker.enabled);
+        assert_eq!(o.tracker.announces_per_key, 3);
+        assert_eq!(o.tracker.scrape_fanout, 2);
         assert_eq!(o.dht.tuning.scrape_early_exit_quorum, 3);
         assert_eq!(o.dht.tuning.scrape_query_timeout, Duration::from_secs(10));
         assert_eq!(o.dht.tuning.scrape_node_cache_keys, 4096);
