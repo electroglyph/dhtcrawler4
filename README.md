@@ -13,7 +13,6 @@ dhtcrawler4 is a fork of [dhtcrawler3](https://github.com/poonasor/dhtcrawler3) 
 
 ## What changed since the dhtcrawler3 fork
 
-Every bullet below is new in this fork — dhtcrawler3 has none of it.
 
 - **Removed content moderation:** report form, CSRF, `dc4-policy` crate, blocked-terms list, denylist/block pages, report/denylist tables, policy fuzz target.
 - **Added seeder scrapes (BEP 33):** the crawler now asks peers how many seeders each torrent has on its own bandwidth budget, shows seeder counts in search with `sort=seeders`, drops dead torrents, and remembers removed keys for 7→28→90 days.
