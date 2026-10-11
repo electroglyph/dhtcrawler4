@@ -70,7 +70,7 @@ pub const MAX_PEER_ATTEMPTS: usize = 8;
 /// Peers tried at the same time per key.
 pub const PARALLEL_ATTEMPTS: usize = 3;
 /// Peers tried per key with no live evidence: unscraped (`None`) or
-/// measured-dead (`Some(0)`) estimates (update.md step 4). Must stay below
+/// measured-dead (`Some(0)`) estimates. Must stay below
 /// [`MAX_PEER_ATTEMPTS`]; the saving lands on keys with peers, since
 /// peerless keys start no dials either way.
 pub const LOW_EFFORT_MAX_ATTEMPTS: usize = 3;
@@ -119,10 +119,20 @@ const METRIC_CLAIMED: &str = "dc4_claimed_total";
 /// label as ok per 10k dials per bucket — the step-4 gate. In-memory only,
 /// permanent, four series.
 const METRIC_DIALS: &str = "dc4_fetch_dials_total";
+/// Per-key stage latency in seconds, labeled by stage: `lookup` (obtain to
+/// first lookup completion), `triage` (obtain to triage verdict), `dial`
+/// (total time with at least one dial in flight), `store` (batched store
+/// write per batch, one observation per batch — not per key), `total`
+/// (whole key). Decomposes the mean per-key occupancy so
+/// throughput work targets the real stage. Keys dropped by the caller's
+/// `key_deadline` record nothing (the future is cancelled), so join
+/// `stage="total"` counts against `dc4_fetch_total` — a gap there IS the
+/// deadline-hit share. In-memory only, permanent, five series.
+const METRIC_STAGE: &str = "dc4_fetch_stage_seconds";
 
-/// Per-key fetch effort derived from the claim-time estimate (update.md
-/// step 4): junk gets a small dial budget and one lookup, proven swarms
-/// get today's budget plus one second lookup when the first drains.
+/// Per-key fetch effort derived from the claim-time estimate: junk gets
+/// a small dial budget and one lookup, proven swarms get today's budget
+/// plus one second lookup when the first drains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEffort {
     /// Peers tried at most (hints and lookup peers share this budget).
@@ -185,7 +195,7 @@ fn claim_chan_depth(tx: &mpsc::Sender<Vec<PendingItem>>) -> usize {
     tx.max_capacity().saturating_sub(tx.capacity())
 }
 
-/// One bulk scan for the single claimer (update.md step 2): leases up to
+/// One bulk scan for the single claimer: leases up to
 /// `n` live keys (`seeders_est > 0`) first, then tops up with the
 /// unfiltered claim so workers never idle. The live leases exclude those
 /// keys from the top-up, so the pair never double-leases; when the live
@@ -921,7 +931,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
             }
         }
         // Boxed so a high-estimate key can run a second lookup after the
-        // first drains (update.md step 4); `scrape_peers` takes `&self`, so
+        // first drains; `scrape_peers` takes `&self`, so
         // every call is a fresh future. The caller's key deadline bounds the
         // pair — no new timeout knob.
         let mut lookup: Option<Pin<Box<dyn Future<Output = dc4_dht::ScrapeReport> + Send>>> = Some(
@@ -932,6 +942,14 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
         let mut running = FuturesUnordered::new();
         let mut deferred = Deferred::default();
         let mut progress = 0usize;
+        // Per-stage latency: `t0` anchors every stage;
+        // lookup/triage record claim-to-first-completion; `dial_busy`
+        // accumulates time with at least one dial in flight.
+        let t0 = Instant::now();
+        let mut t_lookup: Option<Instant> = None;
+        let mut t_triage: Option<Instant> = None;
+        let mut dial_busy = Duration::ZERO;
+        let mut busy_since: Option<Instant> = None;
         // Tracker triage runs alongside the DHT lookup: scrape-triage first,
         // then announces for triage-positive keys only. Announce peers race
         // with traversal peers — first peers win, the loser is cancelled by
@@ -942,7 +960,10 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 Box::pin(fut) as Pin<Box<dyn Future<Output = Option<u32>> + Send>>
             });
         let mut announce: Option<Pin<Box<dyn Future<Output = Vec<SocketAddr>> + Send>>> = None;
-        loop {
+        // The loop value is the outcome: every exit (drained, success,
+        // unreachable break) flows through the stage emission below, so no
+        // path returns without recording.
+        let obtained = loop {
             if queue.is_empty() {
                 deferred.requeue(&mut queue, progress);
             }
@@ -953,6 +974,9 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                         attempts = attempts.saturating_add(1);
                         metrics::counter!(METRIC_DIALS, "est" => bucket).increment(1);
                         running.push(async move { (peer, self.attempt(peer, key, permit).await) });
+                        if busy_since.is_none() {
+                            busy_since = Some(Instant::now());
+                        }
                     }
                     Err(denied) => {
                         metrics::counter!(METRIC_DESTINATION_SKIPPED, "reason" => denied.as_str())
@@ -983,7 +1007,11 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 && triage.is_none()
                 && announce.is_none()
             {
-                break;
+                break if seen.is_empty() {
+                    Obtained::NoPeers
+                } else {
+                    Obtained::Failed
+                };
             }
             tokio::select! {
                 report = async {
@@ -995,6 +1023,9 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 }, if lookup.is_some() => {
                     lookups_done = lookups_done.saturating_add(1);
                     lookup = None;
+                    if t_lookup.is_none() {
+                        t_lookup = Some(Instant::now());
+                    }
                     progress = progress.saturating_add(1);
                     own = OwnAddrs::of(&self.peers);
                     // §8 piggyback: the traversal was already paid for, so
@@ -1036,6 +1067,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                     }
                 }, if triage.is_some() => {
                     triage = None;
+                    t_triage = Some(Instant::now());
                     progress = progress.saturating_add(1);
                     // Triage-positive keys go to the announce stage; the
                     // rest stay DHT-only.
@@ -1077,26 +1109,51 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 }
                 Some((peer, result)) = running.next(), if !running.is_empty() => {
                     progress = progress.saturating_add(1);
+                    if running.is_empty()
+                        && let Some(since) = busy_since.take()
+                    {
+                        dial_busy += Instant::now().saturating_duration_since(since);
+                    }
                     match result {
                         Ok(info) => {
                             // Already fed on TCP connect (see `attempt`); re-offer:
                             // a peer that served metadata just proved live again,
                             // resetting the ring's fail count.
                             self.peers.note_live_addr(peer);
-                            return Obtained::Metadata(info);
+                            break Obtained::Metadata(info);
                         }
                         Err(e) => tracing::debug!(reason = e.label(), "peer fetch failed"),
                     }
                 }
                 // Unreachable: the checks above keep one branch enabled.
-                else => break,
+                else => {
+                    break if seen.is_empty() {
+                        Obtained::NoPeers
+                    } else {
+                        Obtained::Failed
+                    };
+                }
             }
+        };
+        // Per-stage latency: lookup/triage are
+        // obtain-to-first-completion; triage records nothing when trackers
+        // are off. `dial` is total time with a dial in flight, including a
+        // trailing busy span (the exit condition requires `running` empty,
+        // so this only fires on the unreachable break — kept for exactness).
+        metrics::histogram!(METRIC_STAGE, "stage" => "total").record(t0.elapsed());
+        if let Some(t) = t_lookup {
+            metrics::histogram!(METRIC_STAGE, "stage" => "lookup")
+                .record(t.saturating_duration_since(t0));
         }
-        if seen.is_empty() {
-            Obtained::NoPeers
-        } else {
-            Obtained::Failed
+        if let Some(t) = t_triage {
+            metrics::histogram!(METRIC_STAGE, "stage" => "triage")
+                .record(t.saturating_duration_since(t0));
         }
+        if let Some(since) = busy_since.take() {
+            dial_busy += Instant::now().saturating_duration_since(since);
+        }
+        metrics::histogram!(METRIC_STAGE, "stage" => "dial").record(dial_busy);
+        obtained
     }
 
     async fn attempt(
@@ -1293,7 +1350,9 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
             }
         }
         // Successes share one transaction; a rejected batch falls back to
-        // one key at a time, exactly as `process()` would.
+        // one key at a time, exactly as `process()` would. The whole
+        // batched write records one `store` stage observation.
+        let t_store = Instant::now();
         if !readies.is_empty() {
             let pairs: Vec<(DhtKey, NewTorrent)> = readies
                 .iter()
@@ -1349,6 +1408,7 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                 }
             }
         }
+        metrics::histogram!(METRIC_STAGE, "stage" => "store").record(t_store.elapsed());
     }
 
     fn idle_pause(&self) -> Duration {
@@ -2112,6 +2172,14 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fetch_stage_metric_name_is_stable() {
+        // Diag reads this histogram, labeled `stage` =
+        // `lookup`/`triage`/`dial`/`store`/`total`. A rename would silently
+        // break the gate.
+        assert_eq!(METRIC_STAGE, "dc4_fetch_stage_seconds");
     }
 
     #[test]
