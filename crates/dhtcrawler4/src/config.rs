@@ -50,7 +50,7 @@ pub const MIN_INFLIGHT_METADATA_BYTES: usize = 64 * 1024;
 /// Largest `crawl.max_inflight_metadata_bytes`.
 pub const MAX_INFLIGHT_METADATA_BYTES: usize = 64 * 1024 * 1024 * 1024;
 /// Largest `crawl.fetch_workers`.
-pub const MAX_FETCH_WORKERS: usize = 4096;
+pub const MAX_FETCH_WORKERS: usize = 8192;
 /// Largest `crawl.max_connections`.
 pub const MAX_PEER_CONNECTIONS: usize = 65_536;
 /// Most entries in `crawl.bootstrap`.
@@ -188,7 +188,7 @@ pub struct CrawlConfig {
     /// below, the same-socket collision guard).
     pub identities: u32,
     /// Fraction of sampler picks that probe a live address directly instead
-    /// of traversing the frontier (default 0.10). Validated manually to
+    /// of traversing the frontier (default 0.25). Validated manually to
     /// 0.0..=1.0 (NaN rejected) — `check_range` compiles for f64 but NaN
     /// slips through its comparisons, so a manual `contains` check is used.
     pub sampler_live_share: f64,
@@ -277,10 +277,10 @@ impl Default for CrawlConfig {
             max_packets_per_sec: dc4_dht::DEFAULT_MAX_PACKETS_PER_SEC,
             sampler_concurrency: dc4_dht::DEFAULT_SAMPLER_CONCURRENCY,
             identities: 1,
-            sampler_live_share: 0.10,
+            sampler_live_share: 0.25,
             read_only: false,
-            fetch_workers: 3072,
-            max_connections: 12288,
+            fetch_workers: 6144,
+            max_connections: 24576,
             max_metadata_bytes: dc4_peer::DEFAULT_MAX_METADATA,
             max_inflight_metadata_bytes: 1024 * 1024 * 1024,
             max_pending: 5_000_000,
@@ -305,8 +305,8 @@ impl Default for CrawlConfig {
             trackers: Vec::new(),
             tracker_list_url: String::new(),
             tracker_list_refresh_secs: 86_400,
-            tracker_announces_per_key: 3,
-            tracker_scrape_fanout: 2,
+            tracker_announces_per_key: 5,
+            tracker_scrape_fanout: 3,
             tracker_packets_per_sec: 200,
             tracker_timeout_secs: 5,
             bep42_r: None,
@@ -1839,8 +1839,14 @@ mod tests {
         assert!(c.trackers.is_empty());
         assert!(c.tracker_list_url.is_empty());
         assert_eq!(c.tracker_list_refresh_secs, 86_400);
-        assert_eq!(c.tracker_announces_per_key, 3);
-        assert_eq!(c.tracker_scrape_fanout, 2);
+        assert_eq!(
+            c.tracker_announces_per_key,
+            CrawlConfig::default().tracker_announces_per_key
+        );
+        assert_eq!(
+            c.tracker_scrape_fanout,
+            CrawlConfig::default().tracker_scrape_fanout
+        );
         assert_eq!(c.tracker_packets_per_sec, 200);
         assert_eq!(c.tracker_timeout_secs, 5);
         assert_eq!(c.removal_cooldown_days, 7);

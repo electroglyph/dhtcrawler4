@@ -21,7 +21,7 @@ dhtcrawler4 is a fork of [dhtcrawler3](https://github.com/poonasor/dhtcrawler3) 
 - **Fetch effort follows the estimate:** dhtcrawler3 spent 8 dials and one lookup on every key; now dead or unscraped keys get 3 dials and one lookup, 1–4 seeders keep 8 dials, 5+ get a second lookup; per-bucket `dc4_fetch_total{est}` / `dc4_fetch_dials_total{est}` prove the pay.
 - **Dedicated fetch budget:** dhtcrawler3 ran fetch traversals on the 100/s scrape bucket; this fork gives them their own 6000/s bucket and leaves scrapes the uncontended 100/s. New `dc4_lookup_duration_seconds{kind}` histogram; dhtcrawler3's single `throttled` drop label is split per site (update dashboards matching the old label).
 - **Retry hints:** peers found during a lookup are remembered (8 per key) so the retry dials known-good peers first instead of re-traversing; `dc4_hint_added/used_total` and `dc4_hint_age_seconds` show whether hints pay.
-- **Live-neighborhood sampling:** dhtcrawler3 sampled only by walking the routing-table frontier; now 10% of sampler picks query a known-live address directly; dead addresses evict after 3 failures. Kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`.
+- **Live-neighborhood sampling:** dhtcrawler3 sampled only by walking the routing-table frontier; now 25% of sampler picks query a known-live address directly; dead addresses evict after 3 failures. Kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`.
 - **Multi-identity operation:** dhtcrawler3 runs a single node ID; `crawl.identities` (1–8) runs several at once, each on its own UDP port (`dht_port + i`); lookups go out through the closest identity and fan out when it finds nothing. Start with 2–4, not 8.
 - **UDP tracker hybrid:** dhtcrawler3 is DHT-only; this fork also scrapes every claimed key at 2 random UDP trackers, and announces keys with seeders at 3 with a one-shot `started`; dead trackers mean DHT-only, nothing breaks. On by default; `tracker_enabled=false` turns it off. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation.
 - **Store durability:** deleted torrents stay reported-as-deleted so slow indexers still converge, database permissions repair themselves on migrate, refetched torrents come back to life with their liveness data intact, and counters can't overflow.
@@ -146,7 +146,7 @@ sudoedit /etc/dhtcrawler4/dhtcrawler4.toml
 
 Change in `[database]`: `host = "127.0.0.1"` (leave port 5432, name `dc4`).
 On a server, also raise `max_connections`: it sizes each role's database
-pool and the default 8 is lean for 3072 fetch workers (the Docker deployment
+pool and the default 8 is lean for 6144 fetch workers (the Docker deployment
 runs crawl at 128 via `DC4_DATABASE__MAX_CONNECTIONS`). Keep the sum across
 roles comfortably under PostgreSQL's own `max_connections` — the stock
 default of 100 leaves little headroom once you raise the crawl pool (the
@@ -508,7 +508,7 @@ torrents at first. That is normal (next step). Set `DC4_WEB__HSTS: "true"`
 Expect the first searchable torrents within minutes and a steadily growing
 index over hours to days. The default crawl budget (`max_packets_per_sec =
 12000`, `fetch_packets_per_sec = 6000` for fetch traversals
-(`DC4_CRAWL__FETCH_PACKETS_PER_SEC`), 3072 fetch
+(`DC4_CRAWL__FETCH_PACKETS_PER_SEC`), 6144 fetch
 workers) is sized for a server; lower it in
 `deploy/config/dhtcrawler4.toml` on a home connection. Trap: setting
 `fetch_packets_per_sec` (or any packet budget) to `"0"` means "treated as
@@ -796,7 +796,7 @@ How to read the output:
   `dc4_dht_queries_received_total` climbing (especially `get_peers`) proves
   inbound UDP 6881 works — near zero means the internet cannot reach
   the node: fix the firewall/security group, no config knob compensates.
-  All-zero `v6` lines just mean no working IPv6 (harmless). 10% of sampler picks probe known-live addresses directly (`sampler_live_share`, kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`); `dc4_dht_sampler_live_evicted_total` climbing fast means the ring is full of dead addrs.
+  All-zero `v6` lines just mean no working IPv6 (harmless). 25% of sampler picks probe known-live addresses directly (`sampler_live_share`, kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`); `dc4_dht_sampler_live_evicted_total` climbing fast means the ring is full of dead addrs.
 - **Is the queue moving?** `dc4_claim_chan_depth` fluctuating under 256
   is healthy backpressure; pinned at 256 with `dc4_fetch_total` frozen means
   the workers are stuck, not the claimer. `dc4_claimed_total{live="true"}`
@@ -817,7 +817,7 @@ How to read the output:
   Hint age at take time reports as `dc4_hint_age_seconds` — its p50 decides
   the `HINT_TTL` review (5 min today, 15 min if p50 exceeds TTL).
   `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
-  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 3), `tracker_scrape_fanout` (1..=4, default 2), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 5). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
+  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 5), `tracker_scrape_fanout` (1..=4, default 3), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 5). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches

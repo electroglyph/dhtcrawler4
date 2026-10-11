@@ -58,12 +58,12 @@ sampler_concurrency = 1024
 # traversing the frontier (0.0-1.0; 0 disables). Live stores skew toward
 # live swarms; uniform-node samples are mostly dead. A reallocation inside
 # existing budgets, not additional traffic.
-sampler_live_share = 0.1
+sampler_live_share = 0.25
 # Answer no DHT queries and mark ours read-only (BEP 43). Leave false to be a
 # full, reciprocating DHT node.
 read_only = false
-fetch_workers = 3072
-max_connections = 12288
+fetch_workers = 6144
+max_connections = 24576
 max_metadata_bytes = 8388608
 # Total metadata bytes held by all fetches at once (memory bound).
 max_inflight_metadata_bytes = 1073741824
@@ -113,10 +113,10 @@ tracker_enabled = true
 tracker_list_url = ""
 # Seconds between list refreshes.
 tracker_list_refresh_secs = 86400
-# Random live trackers announced per triage-positive key (canary: 2).
-tracker_announces_per_key = 3
+# Random live trackers announced per triage-positive key.
+tracker_announces_per_key = 5
 # Random live trackers scraped per triage batch.
-tracker_scrape_fanout = 2
+tracker_scrape_fanout = 3
 # Pool-wide tracker packet budget.
 tracker_packets_per_sec = 200
 # Per-RPC timeout of tracker queries.

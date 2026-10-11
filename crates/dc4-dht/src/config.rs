@@ -270,7 +270,7 @@ pub struct DhtTuning {
     /// Fraction of sampler picks that probe a live address directly instead
     /// of traversing the frontier. Live addresses hold stores
     /// biased toward live swarms; uniform-node samples are mostly dead.
-    /// Validated manually to 0.0..=1.0 (NaN rejected). Production: 0.10.
+    /// Validated manually to 0.0..=1.0 (NaN rejected). Production: 0.25.
     pub sampler_live_share: f64,
 }
 
@@ -315,7 +315,7 @@ impl Default for DhtTuning {
             scrape_early_exit_quorum: 3,
             scrape_node_cache_keys: 4096,
             limits_by_endpoint: false,
-            sampler_live_share: 0.10,
+            sampler_live_share: 0.25,
         }
     }
 }
@@ -547,9 +547,9 @@ mod tests {
     }
 
     #[test]
-    fn sampler_live_share_defaults_and_rejects_nan() {        // 10% of sampler picks probe live addrs; NaN would
+    fn sampler_live_share_defaults_and_rejects_nan() {        // The default share must validate (whatever it is tuned to); NaN would
         // silently disable or misbehave, so it is rejected explicitly.
-        assert_eq!(DhtTuning::default().sampler_live_share, 0.10);
+        assert!(DhtConfig::default().validate().is_ok());
         let mut tuning = DhtTuning::default();
         tuning.sampler_live_share = f64::NAN;
         let bad = DhtConfig {

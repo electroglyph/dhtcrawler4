@@ -2,6 +2,10 @@
 
 Forked from upstream at `3350799` (2026-09-17, merge of Rust rewrite).
 
+## 0.7.1
+
+- Crawl defaults from live traffic: `fetch_workers` 3072→6144 with `max_connections` 12288→24576 (4/worker headroom kept; workers were the saturated resource while packet budgets, DB pool and throttling all had headroom), `sampler_live_share` 0.10→0.25 (queue is 95%+ unscraped NULL junk — sample live neighborhoods harder), `tracker_announces_per_key` 3→5 and `tracker_scrape_fanout` 2→3 (hybrid paying on all vendored servers). No validation-range changes.
+
 ## 0.7.0
 
 - Expand: peer-finding workstreams (fetch budget, hints, live sampling, multi-identity, tracker hybrid). See entries below.

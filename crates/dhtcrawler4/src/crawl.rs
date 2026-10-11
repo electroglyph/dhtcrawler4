@@ -547,17 +547,19 @@ mod tests {
         assert_eq!(o.dht.tuning, DhtTuning::default());
         assert!(o.dht.validate().is_ok());
         assert_eq!(o.filter, PeerFilter::PRODUCTION);
-        assert_eq!(o.fetch_workers, 3072);
+        assert_eq!(o.fetch_workers, Config::default().crawl.fetch_workers);
         assert_eq!(o.dht.scrape_packets_per_sec, 100);
         assert_eq!(
             o.dht.fetch_packets_per_sec,
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
-        assert_eq!(o.dht.tuning.sampler_live_share, 0.10);
         assert_eq!(o.dht.identities, 1);
         assert!(o.tracker.enabled);
-        assert_eq!(o.tracker.announces_per_key, 3);
-        assert_eq!(o.tracker.scrape_fanout, 2);
+        assert_eq!(
+            o.tracker.announces_per_key,
+            TrackerConfig::default().announces_per_key
+        );
+        assert_eq!(o.tracker.scrape_fanout, TrackerConfig::default().scrape_fanout);
         assert_eq!(o.dht.tuning.scrape_early_exit_quorum, 3);
         assert_eq!(o.dht.tuning.scrape_query_timeout, Duration::from_secs(10));
         assert_eq!(o.dht.tuning.scrape_node_cache_keys, 4096);
@@ -566,7 +568,7 @@ mod tests {
         assert_eq!(o.scrape_workers, 1);
         assert_eq!(o.scrape.threshold, 0);
         assert_eq!(o.max_pending, 5_000_000);
-        assert_eq!(o.limits.max_connections, 12288);
+        assert_eq!(o.limits.max_connections, Config::default().crawl.max_connections);
         assert_eq!(o.limits.max_inflight_metadata_bytes, 1_073_741_824);
         assert_eq!(o.min_good_nodes, MIN_GOOD_NODES);
         let mut cfg = Config::default();

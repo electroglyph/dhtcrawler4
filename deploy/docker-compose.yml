@@ -89,7 +89,7 @@ services:
     environment:
       <<: *dc4-env
       DC4_DATABASE__USER: dc4_crawler
-      # 3072 fetch workers plus admission and scrapes share this pool.
+      # 6144 fetch workers plus admission and scrapes share this pool.
       DC4_DATABASE__MAX_CONNECTIONS: "128"
     secrets:
       - source: dc4_crawler_password
