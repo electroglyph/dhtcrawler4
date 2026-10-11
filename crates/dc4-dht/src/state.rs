@@ -1,9 +1,10 @@
 //! Persistent node state: node IDs, external IPs and contacts.
 //!
-//! Stored as JSON `{version, v4: {id, external_ip, nodes: [{id, addr}]}, v6: …}`
-//! and written atomically (temporary file, fsync, rename). A missing file is
-//! normal; an unreadable, oversized or malformed one is ignored with a
-//! warning. Peer-store contents are never written (R11).
+//! Stored as JSON `{version, v4: [{id, external_ip, nodes: [{id, addr}]}], v6: …}`
+//! (one entry per identity, in bind order) and written atomically (temporary
+//! file, fsync, rename). A missing file is normal; an unreadable, oversized
+//! or malformed one is ignored with a warning — including older versions,
+//! which are never migrated. Peer-store contents are never written (R11).
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -16,7 +17,7 @@ use crate::compact::Family;
 use crate::node_id::NodeId;
 
 /// Format version written and accepted.
-pub(crate) const STATE_VERSION: u32 = 1;
+pub(crate) const STATE_VERSION: u32 = 2;
 /// Contacts kept per address family.
 pub(crate) const MAX_SAVED_NODES: usize = 300;
 /// Largest state file we read.
@@ -28,13 +29,13 @@ const FALLBACK_FILE_NAME: &str = "dht-state.json";
 pub(crate) struct StateFile {
     pub(crate) version: u32,
     #[serde(default)]
-    pub(crate) v4: Option<FamilyState>,
+    pub(crate) v4: Vec<IdentityState>,
     #[serde(default)]
-    pub(crate) v6: Option<FamilyState>,
+    pub(crate) v6: Vec<IdentityState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FamilyState {
+pub(crate) struct IdentityState {
     pub(crate) id: NodeId,
     #[serde(default)]
     pub(crate) external_ip: Option<IpAddr>,
@@ -49,17 +50,18 @@ pub(crate) struct SavedNode {
 }
 
 impl StateFile {
-    pub(crate) fn family(&self, family: Family) -> Option<&FamilyState> {
+    /// Saved identities of `family`, in bind order.
+    pub(crate) fn identities(&self, family: Family) -> &[IdentityState] {
         match family {
-            Family::V4 => self.v4.as_ref(),
-            Family::V6 => self.v6.as_ref(),
+            Family::V4 => &self.v4,
+            Family::V6 => &self.v6,
         }
     }
 
     /// Drops entries of the wrong family and caps the contact lists.
     fn sanitized(mut self) -> Self {
-        for (family, state) in [(Family::V4, &mut self.v4), (Family::V6, &mut self.v6)] {
-            if let Some(s) = state.as_mut() {
+        for (family, states) in [(Family::V4, &mut self.v4), (Family::V6, &mut self.v6)] {
+            for s in states.iter_mut() {
                 s.nodes.retain(|n| Family::of(&n.addr) == family);
                 s.nodes.truncate(MAX_SAVED_NODES);
                 if s.external_ip
@@ -142,15 +144,15 @@ mod tests {
     fn sample() -> StateFile {
         StateFile {
             version: STATE_VERSION,
-            v4: Some(FamilyState {
+            v4: vec![IdentityState {
                 id: NodeId([1; 20]),
                 external_ip: Some("8.8.8.8".parse().unwrap()),
                 nodes: vec![SavedNode {
                     id: NodeId([2; 20]),
                     addr: "9.9.9.9:6881".parse().unwrap(),
                 }],
-            }),
-            v6: None,
+            }],
+            v6: vec![],
         }
     }
 
@@ -163,15 +165,15 @@ mod tests {
         assert_eq!(load(&path), Some(sample()));
         assert!(!dir.path().join("dht.json.tmp").exists());
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 1"));
+        assert!(text.contains("\"version\": 2"));
         assert!(text.contains(&"01".repeat(20)));
         // Overwrite.
         let mut other = sample();
-        other.v6 = Some(FamilyState {
+        other.v6 = vec![IdentityState {
             id: NodeId([3; 20]),
             external_ip: None,
             nodes: vec![],
-        });
+        }];
         save(&path, &other).unwrap();
         assert_eq!(load(&path), Some(other));
     }
@@ -183,8 +185,12 @@ mod tests {
         for bad in [
             "",
             "not json",
-            "{\"version\": 2}",
-            "{\"version\": 1, \"v4\": {\"id\": \"zz\"}}",
+            "{\"version\": 3}",
+            // The old single-identity shape is never migrated: the object
+            // no longer parses as a list, so it is ignored like any other
+            // unusable file and the IDs regenerate.
+            "{\"version\": 1, \"v4\": {\"id\": \"ab00000000000000000000000000000000000000\"}}",
+            "{\"version\": 2, \"v4\": {\"id\": \"zz\"}}",
             "[]",
         ] {
             fs::write(&path, bad).unwrap();
@@ -203,7 +209,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dht.json");
         let mut s = sample();
-        let v4 = s.v4.as_mut().unwrap();
+        let v4 = &mut s.v4[0];
         v4.external_ip = Some("2a00::1".parse().unwrap());
         v4.nodes.push(SavedNode {
             id: NodeId([4; 20]),
@@ -218,21 +224,21 @@ mod tests {
         }
         save(&path, &s).unwrap();
         let loaded = load(&path).unwrap();
-        let v4 = loaded.family(Family::V4).unwrap();
+        let v4 = &loaded.identities(Family::V4)[0];
         assert_eq!(v4.external_ip, None);
         assert_eq!(v4.nodes.len(), MAX_SAVED_NODES);
         assert!(v4.nodes.iter().all(|n| n.addr.is_ipv4()));
-        assert!(loaded.family(Family::V6).is_none());
+        assert!(loaded.identities(Family::V6).is_empty());
         // Minimal files are accepted.
         fs::write(
             &path,
             format!(
-                "{{\"version\":1,\"v4\":{{\"id\":\"{}\"}}}}",
+                "{{\"version\":2,\"v4\":[{{\"id\":\"{}\"}}]}}",
                 "ab".repeat(20)
             ),
         )
         .unwrap();
         let minimal = load(&path).unwrap();
-        assert_eq!(minimal.v4.unwrap().id, NodeId([0xab; 20]));
+        assert_eq!(minimal.v4[0].id, NodeId([0xab; 20]));
     }
 }

@@ -53,12 +53,46 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::DropGuard;
 
+/// Indices of the XOR-closest entry per family. Pure for tests.
+fn closest_per_family(ids: &[(Family, NodeId)], target: &NodeId) -> Vec<usize> {
+    let mut best: Vec<(Family, crate::node_id::Distance, usize)> = Vec::new();
+    for (i, (family, id)) in ids.iter().enumerate() {
+        let d = id.distance(target);
+        match best.iter_mut().find(|(f, ..)| f == family) {
+            Some(slot) => {
+                if d < slot.1 {
+                    slot.1 = d;
+                    slot.2 = i;
+                }
+            }
+            None => best.push((*family, d, i)),
+        }
+    }
+    best.into_iter().map(|(.., i)| i).collect()
+}
+
+/// One socket per family: the identity whose ID is XOR-closest to `target`.
+/// Fewer hops per lookup than querying from every identity. With one
+/// identity this is the same set as before.
+fn route_sockets(inner: &crate::node::Inner, target: &NodeId) -> Vec<Arc<crate::node::SocketNode>> {
+    let ids: Vec<(Family, NodeId)> = inner
+        .sockets
+        .iter()
+        .map(|s| (s.family, lock(&s.state).id))
+        .collect();
+    closest_per_family(&ids, target)
+        .into_iter()
+        .map(|i| Arc::clone(&inner.sockets[i]))
+        .collect()
+}
+
 pub use compact::{Family, is_dialable};
 pub use config::{
     DEFAULT_BOOTSTRAP, DEFAULT_CLIENT_VERSION, DEFAULT_FETCH_PACKETS_PER_SEC,
     DEFAULT_MAX_PACKETS_PER_SEC, DEFAULT_PORT, DEFAULT_RESPONDER_BYTES_PER_SEC,
     DEFAULT_RESPONDER_REPLIES_PER_SEC, DEFAULT_SAMPLER_CONCURRENCY,
-    DEFAULT_SCRAPE_PACKETS_PER_SEC, DhtConfig, DhtTuning, MAX_SAMPLER_CONCURRENCY,
+    DEFAULT_SCRAPE_PACKETS_PER_SEC, DhtConfig, DhtTuning, MAX_IDENTITIES,
+    MAX_SAMPLER_CONCURRENCY,
 };
 pub use node::MIN_GOOD_NODES;
 pub use node_id::NodeId;
@@ -213,9 +247,9 @@ impl Dht {
     /// reject our own addresses ([`own_addrs`](Dht::own_addrs)).
     pub async fn get_peers(&self, key: DhtKey, timeout: Duration) -> Vec<SocketAddr> {
         let deadline = after(Instant::now(), timeout);
-        let lookups = self
-            .inner
-            .sockets
+        let target = NodeId::from(key);
+        let routed = route_sockets(&self.inner, &target);
+        let lookups = routed
             .iter()
             .map(|sock| lookup::get_peers(&self.inner, sock, key, deadline));
         let mut seen = HashSet::new();
@@ -234,9 +268,9 @@ impl Dht {
             return 0;
         }
         let deadline = after(Instant::now(), self.inner.cfg.tuning.lookup_timeout);
-        let announces = self
-            .inner
-            .sockets
+        let target = NodeId::from(key);
+        let routed = route_sockets(&self.inner, &target);
+        let announces = routed
             .iter()
             .map(|sock| lookup::announce(&self.inner, sock, key, port, deadline));
         join_all(announces)
@@ -254,9 +288,9 @@ impl Dht {
     /// signature so existing callers are untouched.
     pub async fn scrape(&self, key: DhtKey, timeout: Duration) -> ScrapeReport {
         let deadline = after(Instant::now(), timeout);
-        let lookups = self
-            .inner
-            .sockets
+        let target = NodeId::from(key);
+        let routed = route_sockets(&self.inner, &target);
+        let lookups = routed
             .iter()
             .map(|sock| lookup::scrape(&self.inner, sock, key, deadline));
         let mut report = ScrapeReport::default();
@@ -273,9 +307,9 @@ impl Dht {
     /// uncontended); the fetch role uses this.
     pub async fn scrape_fetch(&self, key: DhtKey, timeout: Duration) -> ScrapeReport {
         let deadline = after(Instant::now(), timeout);
-        let lookups = self
-            .inner
-            .sockets
+        let target = NodeId::from(key);
+        let routed = route_sockets(&self.inner, &target);
+        let lookups = routed
             .iter()
             .map(|sock| lookup::scrape_fetch(&self.inner, sock, key, deadline));
         let mut report = ScrapeReport::default();
@@ -300,7 +334,9 @@ impl Dht {
     ) -> ScrapeReport {
         let deadline = after(Instant::now(), timeout);
         let mut report = ScrapeReport::default();
-        for sock in self.inner.sockets.iter().filter(|s| s.family == Family::V4) {
+        let target = NodeId::from(key);
+        let routed = route_sockets(&self.inner, &target);
+        for sock in routed.iter().filter(|s| s.family == Family::V4) {
             if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
                 break;
             }
@@ -309,7 +345,7 @@ impl Dht {
         if report.is_live(threshold) {
             return report;
         }
-        for sock in self.inner.sockets.iter().filter(|s| s.family == Family::V6) {
+        for sock in routed.iter().filter(|s| s.family == Family::V6) {
             if Instant::now() >= deadline || self.inner.cancel.is_cancelled() {
                 break;
             }
@@ -442,5 +478,31 @@ mod scrape_tests {
         assert_eq!(report.seeders_est(), Some(1));
         assert!(report.is_live(0));
         assert!(!report.is_live(1), "equal-to-threshold is dead, not live");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn closest_socket_per_family() {
+        let target = NodeId([0x80; 20]);
+        let near_v4 = NodeId([0x80; 20]);
+        let far_v4 = NodeId([0x00; 20]);
+        let v6 = NodeId([0xFF; 20]);
+        let ids = vec![
+            (Family::V4, far_v4),
+            (Family::V4, near_v4),
+            (Family::V6, v6),
+        ];
+        assert_eq!(closest_per_family(&ids, &target), vec![1, 2]);
+        assert!(closest_per_family(&[], &target).is_empty());
+        // One identity: the same set as the old fan-out.
+        assert_eq!(
+            closest_per_family(&[(Family::V4, near_v4)], &target),
+            vec![0]
+        );
     }
 }

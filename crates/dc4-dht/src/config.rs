@@ -28,6 +28,9 @@ pub const DEFAULT_BOOTSTRAP: [&str; 4] = [
 /// Default BEP 33 scrape budget in packets per second, kept much smaller
 /// than the crawl bucket so scrapes never starve discovery.
 pub const DEFAULT_SCRAPE_PACKETS_PER_SEC: u32 = 100;
+/// Upper bound on `identities`: 8 matches the 8-way split in the
+/// multi-replica runbook.
+pub const MAX_IDENTITIES: u32 = 8;
 /// Default dedicated fetch budget in packets per second:
 /// fetch traversals are multi-packet lookups running at ~2,000+/s measured,
 /// so 6,000 gives ~3x headroom — fetch alone can never be the binding
@@ -66,6 +69,10 @@ pub struct DhtConfig {
     /// Dedicated fetch budget in packets per second: fetch
     /// `get_peers` traversals charge this bucket, never the scrape bucket.
     pub fetch_packets_per_sec: u32,
+    /// In-process DHT identities. Each binds its own UDP port per family
+    /// (`dht_port + i`), with its own node ID and routing table. 1 is
+    /// today's behavior. Ports are derived from `dht_port`, no extra knob.
+    pub identities: u32,
     /// Run the BEP 51 sampler, which emits `Discovered { source: Sample }`.
     pub sampler: bool,
     /// Number of concurrent `sample_infohashes` queries.
@@ -93,6 +100,7 @@ impl Default for DhtConfig {
             max_packets_per_sec: DEFAULT_MAX_PACKETS_PER_SEC,
             scrape_packets_per_sec: DEFAULT_SCRAPE_PACKETS_PER_SEC,
             fetch_packets_per_sec: DEFAULT_FETCH_PACKETS_PER_SEC,
+            identities: 1,
             sampler: true,
             sampler_concurrency: DEFAULT_SAMPLER_CONCURRENCY,
             read_only: false,
@@ -132,6 +140,11 @@ impl DhtConfig {
             return Err(Error::Config(
                 "fetch_packets_per_sec must be at least 1".into(),
             ));
+        }
+        if self.identities == 0 || self.identities > MAX_IDENTITIES {
+            return Err(Error::Config(format!(
+                "identities must be between 1 and {MAX_IDENTITIES}"
+            )));
         }
         if self.sampler_concurrency == 0 || self.sampler_concurrency > MAX_SAMPLER_CONCURRENCY {
             return Err(Error::Config(format!(

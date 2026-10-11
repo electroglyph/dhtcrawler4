@@ -80,6 +80,7 @@ fn stats_line(dht: &Dht) -> String {
 /// switched per test.
 fn live_config(sampler: bool) -> DhtConfig {
     DhtConfig {
+        identities: 1,
         bind_v4: Some("0.0.0.0:0".parse().unwrap()),
         bind_v6: Some("[::]:0".parse().unwrap()),
         bootstrap: DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_owned()).collect(),

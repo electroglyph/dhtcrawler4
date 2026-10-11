@@ -552,6 +552,11 @@ docker compose ps                     # includes healthcheck status
   pre-req is `concurrent_observes_do_not_lose_seen_counts` in `crates/dc4-store/src/tests.rs`.
 - Budget: 8x packet budget (~12 MB/s at full reply rate), 8x RAM/sockets/DB pool.
 - Start with 2-4 replicas, compare the `discovered` slope, then scale to 8.
+- Alternative: `crawl.identities = N` (1-8, `DC4_CRAWL__IDENTITIES`) runs N node
+  IDs in one process instead of N processes: ports `dht_port..dht_port+N-1`
+  per family, own routing table per identity, everything else shared. Publish
+  the port range and start with 2-4; back to `1` plus a restart to roll back.
+  Extra identities cost ~2-5 MB RAM each; abort past ~15 MB/identity.
 
 ### Without Docker
 

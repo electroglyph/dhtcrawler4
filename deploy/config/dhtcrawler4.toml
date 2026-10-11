@@ -32,6 +32,10 @@ bind_v4 = "0.0.0.0"
 # IPv6 DHT (BEP 32). Disabled automatically, with a warning, when the host has no
 # global IPv6 address. Set to "" to disable it explicitly.
 bind_v6 = "::"
+# In-process DHT identities (1-8, default 1). Each binds `dht_port + i` per
+# family with its own node ID and routing table, sharing everything else.
+# With N > 1, publish/allow the whole port range (dht_port..dht_port+N-1).
+identities = 1
 bootstrap = [
   "dht.libtorrent.org:25401",
   "dht.transmissionbt.com:6881",

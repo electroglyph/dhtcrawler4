@@ -59,6 +59,7 @@ fn fast_tuning() -> DhtTuning {
 
 fn config(bootstrap: &[SocketAddr]) -> DhtConfig {
     DhtConfig {
+        identities: 1,
         bind_v4: Some("127.0.0.1:0".parse().unwrap()),
         bind_v6: None,
         bootstrap: bootstrap.iter().map(ToString::to_string).collect(),
@@ -834,6 +835,7 @@ async fn start_errors() {
     let (tx, _rx) = mpsc::channel(1);
     let err = Dht::start(
         DhtConfig {
+            identities: 1,
             bind_v4: None,
             bind_v6: None,
             ..DhtConfig::default()

@@ -180,6 +180,9 @@ pub struct CrawlConfig {
     pub max_packets_per_sec: u32,
     /// Concurrent BEP 51 queries.
     pub sampler_concurrency: usize,
+    /// In-process DHT identities. Each binds `dht_port + i` per family with
+    /// its own node ID and routing table. 1 is today's behavior.
+    pub identities: u32,
     /// Fraction of sampler picks that probe a live address directly instead
     /// of traversing the frontier (default 0.10). Validated
     /// manually to 0.0..=1.0 (NaN rejected) — `check_range` is integer-only
@@ -250,6 +253,7 @@ impl Default for CrawlConfig {
             state_dir: PathBuf::from("/var/lib/dhtcrawler4"),
             max_packets_per_sec: dc4_dht::DEFAULT_MAX_PACKETS_PER_SEC,
             sampler_concurrency: dc4_dht::DEFAULT_SAMPLER_CONCURRENCY,
+            identities: 1,
             sampler_live_share: 0.10,
             read_only: false,
             fetch_workers: 3072,
@@ -786,6 +790,37 @@ impl Config {
             1,
             dc4_dht::MAX_SAMPLER_CONCURRENCY,
         )?;
+        check_range(
+            "crawl.identities",
+            c.identities,
+            1,
+            dc4_dht::MAX_IDENTITIES,
+        )?;
+        if u32::from(c.dht_port).saturating_add(c.identities).saturating_sub(1)
+            > u32::from(u16::MAX)
+        {
+            return Err(invalid(
+                "crawl.dht_port + crawl.identities - 1 must fit in a port (<= 65535)",
+            ));
+        }
+        // The identity port range must not claim the metrics/web sockets.
+        for base in [v4, v6].into_iter().flatten() {
+            for i in 0..c.identities {
+                let addr =
+                    SocketAddr::new(base.ip(), base.port().wrapping_add(i as u16));
+                if listen_addrs_overlap(addr, self.metrics.listen) {
+                    return Err(invalid(format!(
+                        "crawl DHT identity {addr} overlaps metrics.listen"
+                    )));
+                }
+                if self.web.listen.port() != 0 && listen_addrs_overlap(addr, self.web.listen)
+                {
+                    return Err(invalid(format!(
+                        "crawl DHT identity {addr} overlaps web.listen"
+                    )));
+                }
+            }
+        };
         // Manual, not `check_range`: NaN slips through `<`/`>` comparisons;
         // `contains` fails NaN (mirrors `DhtTuning::validate`).
         if !(0.0..=1.0).contains(&c.sampler_live_share) {
@@ -1251,6 +1286,7 @@ mod tests {
         assert!(EXAMPLE.contains("search_cache_ttl_secs"));
         assert!(EXAMPLE.contains("sampler_live_share"));
         assert!(EXAMPLE.contains("fetch_packets_per_sec"));
+        assert!(EXAMPLE.contains("identities"));
         assert_eq!(
             parsed.web.search_cache_size,
             dc4_web::DEFAULT_SEARCH_CACHE_ENTRIES
@@ -1544,6 +1580,9 @@ mod tests {
             ("DC4_CRAWL__BOOTSTRAP", "no-port"),
             ("DC4_CRAWL__SAMPLER_CONCURRENCY", "1025"),
             ("DC4_CRAWL__SAMPLER_CONCURRENCY", "0"),
+            ("DC4_CRAWL__IDENTITIES", "0"),
+            ("DC4_CRAWL__IDENTITIES", "9"),
+            ("DC4_CRAWL__DHT_PORT", "9100"),
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "1.5"),
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "-0.1"),
             ("DC4_CRAWL__SAMPLER_LIVE_SHARE", "NaN"),
@@ -1576,6 +1615,12 @@ mod tests {
         }
         let both_off = with_env(&[("DC4_CRAWL__BIND_V4", ""), ("DC4_CRAWL__BIND_V6", "")]);
         assert!(both_off.is_err());
+        // The identity port range must fit in 16 bits.
+        let overflow = with_env(&[
+            ("DC4_CRAWL__DHT_PORT", "65535"),
+            ("DC4_CRAWL__IDENTITIES", "2"),
+        ]);
+        assert!(overflow.is_err());
         // With a URL, host and name may be empty.
         assert!(
             with_env(&[
@@ -1660,6 +1705,7 @@ mod tests {
             c.fetch_packets_per_sec,
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
+        assert_eq!(c.identities, 1);
         assert_eq!(c.removal_cooldown_days, 7);
         assert_eq!(c.tombstone_purge_hours, 1);
         assert_eq!(c.gave_up_purge_hours, 1);

@@ -69,6 +69,7 @@ pub fn fast_tuning() -> DhtTuning {
 /// A loopback node bootstrapped from `bootstrap`.
 pub fn node_config(bootstrap: &[SocketAddr], sampler: bool) -> DhtConfig {
     DhtConfig {
+        identities: 1,
         bind_v4: Some("127.0.0.1:0".parse().unwrap()),
         bind_v6: None,
         bootstrap: bootstrap.iter().map(ToString::to_string).collect(),

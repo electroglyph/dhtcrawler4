@@ -95,7 +95,9 @@ services:
       - source: dc4_crawler_password
         target: db_password
     ports:
-      - "6881:6881/udp"   # IPv4 and IPv6
+      - "6881:6881/udp"   # IPv4 and IPv6. With crawl.identities = N > 1,
+                          # publish "6881-688N:6881-688N/udp" and open the
+                          # same range on the firewall instead.
     volumes:
       - state:/var/lib/dhtcrawler4
     networks: [backend, egress]

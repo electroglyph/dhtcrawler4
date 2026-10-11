@@ -36,7 +36,7 @@ use crate::ratelimit::{InboundLimiter, QuerySpacing, ResponderBudget, TokenBucke
 use crate::responder::{self, AnswerContext, wanted};
 use crate::routing::{K, RoutingTable, TableConfig};
 use crate::sampler::Sampler;
-use crate::state::{self, FamilyState, MAX_SAVED_NODES, STATE_VERSION, SavedNode, StateFile};
+use crate::state::{self, IdentityState, MAX_SAVED_NODES, STATE_VERSION, SavedNode, StateFile};
 use crate::stats::{Counters, DhtStatsSnapshot, DropReason, incr};
 use crate::token::TokenSecrets;
 use crate::util::{after, after_skip, lock, remaining_budget};
@@ -171,7 +171,7 @@ fn usable(addr: &SocketAddr, family: Family, policy: AddrPolicy) -> bool {
 
 /// The saved external IP of `family`, if it is still acceptable.
 fn saved_external_ip(
-    saved: Option<&FamilyState>,
+    saved: Option<&IdentityState>,
     family: Family,
     policy: AddrPolicy,
 ) -> Option<IpAddr> {
@@ -184,18 +184,30 @@ fn saved_external_ip(
 /// A bound socket and its actual address.
 type Bound = (Family, UdpSocket, SocketAddr);
 
-/// Binds the configured sockets (design §7). An IPv4 bind failure is an
-/// error. IPv6 is skipped with a warning when `bind_v6` is unspecified and
-/// the host has no global IPv6 address, or when its bind fails; that is an
-/// error only if no socket is left.
+/// Binds the configured sockets (design §7): `identities` ports per family,
+/// `dht_port + i`. An IPv4 bind failure is an error. IPv6 is skipped with a
+/// warning when `bind_v6` is unspecified and the host has no global IPv6
+/// address; per-port IPv6 failures warn and skip that identity. Either is
+/// an error only if no socket is left.
 fn bind_sockets(cfg: &DhtConfig) -> Result<Vec<Bound>, Error> {
     let mut out = Vec::new();
+    let n = cfg.identities.max(1) as usize;
     if let Some(addr) = cfg.bind_v4 {
-        let socket = net::bind_udp(addr).map_err(|source| Error::Bind { addr, source })?;
-        let local = socket
-            .local_addr()
-            .map_err(|source| Error::Bind { addr, source })?;
-        out.push((Family::V4, socket, local));
+        for i in 0..n {
+            // Port 0 means any port: every identity binds its own ephemeral
+            // port instead of deriving from 0.
+            let port = if addr.port() == 0 {
+                0
+            } else {
+                addr.port().wrapping_add(i as u16)
+            };
+            let addr = SocketAddr::new(addr.ip(), port);
+            let socket = net::bind_udp(addr).map_err(|source| Error::Bind { addr, source })?;
+            let local = socket
+                .local_addr()
+                .map_err(|source| Error::Bind { addr, source })?;
+            out.push((Family::V4, socket, local));
+        }
     }
     let Some(addr) = cfg.bind_v6 else {
         return Ok(out);
@@ -207,11 +219,19 @@ fn bind_sockets(cfg: &DhtConfig) -> Result<Vec<Bound>, Error> {
         tracing::warn!("the host has no global IPv6 address; the DHT runs on IPv4 only");
         return Ok(out);
     }
-    match net::bind_udp(addr).and_then(|socket| socket.local_addr().map(|local| (socket, local))) {
-        Ok((socket, local)) => out.push((Family::V6, socket, local)),
-        Err(source) if out.is_empty() => return Err(Error::Bind { addr, source }),
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot bind the IPv6 DHT socket; the DHT runs on IPv4 only")
+    for i in 0..n {
+        let port = if addr.port() == 0 {
+            0
+        } else {
+            addr.port().wrapping_add(i as u16)
+        };
+        let addr = SocketAddr::new(addr.ip(), port);
+        match net::bind_udp(addr).and_then(|socket| socket.local_addr().map(|local| (socket, local))) {
+            Ok((socket, local)) => out.push((Family::V6, socket, local)),
+            Err(source) if out.is_empty() => return Err(Error::Bind { addr, source }),
+            Err(e) => {
+                tracing::warn!(error = %e, addr = %addr, "cannot bind an IPv6 DHT socket; that identity runs on IPv4 only")
+            }
         }
     }
     Ok(out)
@@ -220,7 +240,7 @@ fn bind_sockets(cfg: &DhtConfig) -> Result<Vec<Bound>, Error> {
 impl SocketNode {
     fn new(
         (family, socket, local_addr): Bound,
-        saved: Option<&FamilyState>,
+        saved: Option<&IdentityState>,
         cfg: &DhtConfig,
         policy: AddrPolicy,
         own: Arc<OwnAddrs>,
@@ -318,19 +338,31 @@ impl Inner {
         };
         let bound = bind_sockets(&cfg)?;
         let now = Instant::now();
-        let saved_family = |family| saved.as_ref().and_then(|s| s.family(family));
+        // Identity index within the family: bind order is stable across
+        // restarts, so entry i backs socket i.
+        let mut next_index = std::collections::HashMap::new();
         let mut own = OwnAddrs::default();
         for (family, _, local) in &bound {
+            let index = next_index.entry(*family).or_insert(0);
+            let saved = saved
+                .as_ref()
+                .and_then(|s| s.identities(*family).get(*index));
             own.add(*local);
-            if let Some(ip) = saved_external_ip(saved_family(*family), *family, policy) {
+            if let Some(ip) = saved_external_ip(saved, *family, policy) {
                 own.add(SocketAddr::new(ip, local.port()));
             }
+            *index += 1;
         }
         let own = Arc::new(own);
+        let mut next_index = std::collections::HashMap::new();
         let sockets = bound
             .into_iter()
             .map(|b| {
-                let saved = saved_family(b.0);
+                let index = next_index.entry(b.0).or_insert(0);
+                let saved = saved
+                    .as_ref()
+                    .and_then(|s| s.identities(b.0).get(*index));
+                *index += 1;
                 Arc::new(SocketNode::new(
                     b,
                     saved,
@@ -1107,12 +1139,25 @@ impl Inner {
         exclude: &SocketAddr,
         now: Instant,
     ) -> Option<Vec<CompactNode>> {
-        let sock = self.socket(family)?;
-        let st = lock(&sock.state);
-        let mut nodes = st.table.closest(target, K.saturating_add(1), now, true);
-        nodes.retain(|n| n.addr != *exclude);
-        nodes.truncate(K);
-        Some(nodes)
+        // Every identity of the family answers with the union of their
+        // tables: each is a distinct node, and the response carries the
+        // closest nodes we know. One socket behaves exactly as before.
+        let mut merged: Vec<CompactNode> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for sock in self.sockets.iter().filter(|s| s.family == family) {
+            let st = lock(&sock.state);
+            for n in st.table.closest(target, K.saturating_add(1), now, true) {
+                if n.addr != *exclude && seen.insert(n.addr) {
+                    merged.push(n);
+                }
+            }
+        }
+        if self.sockets.iter().all(|s| s.family != family) {
+            return None;
+        }
+        merged.sort_by(|a, b| a.id.distance(target).cmp(&b.id.distance(target)));
+        merged.truncate(K);
+        Some(merged)
     }
 
     /// Takes one reply from the responder budget, or counts the query as dropped.
@@ -1449,11 +1494,11 @@ impl Inner {
         let now = Instant::now();
         let mut file = StateFile {
             version: STATE_VERSION,
-            v4: None,
-            v6: None,
+            v4: Vec::new(),
+            v6: Vec::new(),
         };
         for sock in &self.sockets {
-            let family_state = {
+            let identity = {
                 let st = lock(&sock.state);
                 let mut nodes: Vec<SavedNode> = st
                     .table
@@ -1475,15 +1520,15 @@ impl Inner {
                         })
                         .collect();
                 }
-                FamilyState {
+                IdentityState {
                     id: st.id,
                     external_ip: st.external_ip,
                     nodes,
                 }
             };
             match sock.family {
-                Family::V4 => file.v4 = Some(family_state),
-                Family::V6 => file.v6 = Some(family_state),
+                Family::V4 => file.v4.push(identity),
+                Family::V6 => file.v6.push(identity),
             }
         }
         match tokio::task::spawn_blocking(move || state::save(&path, &file)).await {
@@ -1513,9 +1558,13 @@ impl Inner {
             };
             let family = stats.family_mut(sock.family);
             family.enabled = true;
-            family.routing_nodes = routing_nodes;
-            family.good_nodes = good_nodes;
-            family.pending_queries = pending_queries;
+            family.routing_nodes = family
+                .routing_nodes
+                .saturating_add(routing_nodes);
+            family.good_nodes = family.good_nodes.saturating_add(good_nodes);
+            family.pending_queries = family
+                .pending_queries
+                .saturating_add(pending_queries);
             if let Some(sampler) = &self.sampler {
                 (family.sampler_frontier, family.sampler_visited) = sampler.sizes(sock.family);
             }
@@ -1830,3 +1879,28 @@ mod tests {
         assert_eq!(known.len(), 4);
     }
 }
+
+    #[tokio::test]
+    async fn bind_sockets_gives_each_identity_its_own_port() {
+        let mut cfg = DhtConfig::default();
+        cfg.bind_v4 = Some("127.0.0.1:0".parse().unwrap());
+        cfg.bind_v6 = None;
+        cfg.identities = 3;
+        let bound = bind_sockets(&cfg).unwrap();
+        assert_eq!(bound.len(), 3);
+        let mut ports: Vec<u16> = bound.iter().map(|(_, _, local)| local.port()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 3, "identities must not share a port");
+        assert!(bound.iter().all(|(family, ..)| *family == Family::V4));
+    }
+
+    #[tokio::test]
+    async fn bind_sockets_single_identity_is_todays_behavior() {
+        let mut cfg = DhtConfig::default();
+        cfg.bind_v4 = Some("127.0.0.1:0".parse().unwrap());
+        cfg.bind_v6 = None;
+        cfg.identities = 1;
+        let bound = bind_sockets(&cfg).unwrap();
+        assert_eq!(bound.len(), 1);
+    }
