@@ -602,6 +602,7 @@ cd deploy
 df -h / | tail -1              # the build needs several GB free
 docker compose up -d --build
 docker image prune -f          # drop the superseded image
+docker builder prune -a -f     # drop the superseded build cache (without -a this reclaims ~0)
 ```
 
 What happens, in order: the image rebuilds from the new tree; `migrate`
