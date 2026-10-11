@@ -108,8 +108,8 @@ tracker_enabled = true
 #   "udp://tracker.example:6969/announce",
 # ]
 # Tracker list URL for refresh (plain HTTP only: no TLS client, so https
-# fails logged and keeps the last set). Empty disables refresh: vendored
-# snapshot plus explicit list only.
+# is rejected at validation — point it at an http:// mirror to enable).
+# Empty disables refresh: vendored snapshot plus explicit list only.
 tracker_list_url = ""
 # Seconds between list refreshes.
 tracker_list_refresh_secs = 86400

@@ -10,6 +10,8 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dc4_core::DhtKey;
@@ -1141,6 +1143,243 @@ async fn sample_replies_are_capped_and_checked() {
         );
         assert_eq!(liar, 0, "samples from a reply under another ID");
         crawler.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Counts `sample_infohashes` queries arriving at `client`'s socket,
+/// answering every query so the querier keeps talking: samples get a
+/// one-key reply (keeps a live-ring entry alive), everything else a plain
+/// response. Returns the counter and the responder task.
+fn counting_responder(
+    client: RawClient,
+) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let id = client.id;
+    let counted = Arc::clone(&count);
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((len, src)) = client.socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(msg) = krpc::decode(&buf[..len]) else {
+                continue;
+            };
+            let Body::Query(query) = &msg.body else {
+                continue;
+            };
+            if matches!(query.method, Method::SampleInfohashes { .. }) {
+                counted.fetch_add(1, Ordering::Relaxed);
+                let bytes = raw_sample_reply(&msg.tid, id, &[DhtKey([9u8; 20])]);
+                client.socket.send_to(&bytes, src).await.ok();
+            } else {
+                send_msg(&client, src, &reply_as(&msg, id)).await;
+            }
+        }
+    });
+    (count, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_identity_fallback_fires_on_empty_primary() {
+    timeout(Duration::from_secs(60), async {
+        // B runs two identities on distinct loopback ports; R is the only
+        // node either identity knows. A lookup for an unknown key finds
+        // nothing on the primary socket, so the fallback identity must
+        // query too: R observes `get_peers` from BOTH of B's ports. One
+        // port would mean the primary round ran alone and the fallback
+        // this test exists for never fired.
+        let (b, _rx) = start(DhtConfig {
+            identities: 2,
+            ..config(&[])
+        })
+        .await;
+        let ports: HashSet<SocketAddr> = b.local_addrs().into_iter().collect();
+        assert_eq!(ports.len(), 2, "two identities need two ports");
+
+        let mut r = RawClient::new().await;
+        // Teach both identities R: ping each port, then answer each
+        // socket's confirmation ping back so R enters both tables. A
+        // ping-back from a port proves that socket's table learned R;
+        // without both, the test could pass vacuously (a socket with an
+        // empty table queries nothing, fallback or not).
+        for port in &ports {
+            r.call(*port, Method::Ping).await;
+        }
+        for port in ports.iter() {
+            let q = r
+                .next_query_from(*port, Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|| panic!("no confirmation ping from {port}"));
+            send_msg(&r, *port, &reply_as(&q, r.id)).await;
+        }
+
+        // Serve the lookup: empty replies to everything (so the primary
+        // genuinely finds nothing), while reporting `get_peers` sources.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<SocketAddr>();
+        let r_id = r.id;
+        let serve = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((len, src)) = r.socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Ok(msg) = krpc::decode(&buf[..len]) else {
+                    continue;
+                };
+                let Body::Query(query) = &msg.body else {
+                    continue;
+                };
+                if matches!(query.method, Method::GetPeers { .. }) {
+                    seen_tx.send(src).ok();
+                }
+                send_msg(&r, src, &reply_as(&msg, r_id)).await;
+            }
+        });
+
+        let found = b.get_peers(random_key(), Duration::from_secs(5)).await;
+        assert!(
+            found.is_empty(),
+            "the scripted network holds nothing, yet {found:?} came back"
+        );
+        serve.abort();
+        let mut observed = HashSet::new();
+        while let Ok(src) = seen_rx.try_recv() {
+            observed.insert(src);
+        }
+        assert_eq!(
+            observed, ports,
+            "fallback did not fire: get_peers reached only {observed:?}, want both {ports:?}"
+        );
+        b.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sampler_share_one_probes_only_live_addrs() {
+    timeout(Duration::from_secs(60), async {
+        // share = 1.0: every worker pick must probe the live ring, never
+        // the frontier. The ring is seeded before the frontier peer is
+        // known, and the frontier starts empty anyway, so a frontier
+        // sample here would mean the branch wiring is wrong, not a race.
+        let (node, _rx) = start(DhtConfig {
+            sampler: true,
+            tuning: DhtTuning {
+                sampler_live_share: 1.0,
+                ..fast_tuning()
+            },
+            ..config(&[])
+        })
+        .await;
+        let to = addr(&node);
+        let live = RawClient::new().await;
+        node.note_live_addr(live.addr());
+        let mut frontier = RawClient::new().await;
+        frontier.call(to, Method::Ping).await;
+        let (live_count, live_task) = counting_responder(live);
+        let (frontier_count, frontier_task) = counting_responder(frontier);
+        wait_until("live probes to arrive", Duration::from_secs(15), || {
+            live_count.load(Ordering::Relaxed) >= 3
+        })
+        .await;
+        sleep(Duration::from_secs(2)).await;
+        assert!(
+            live_count.load(Ordering::Relaxed) >= 3,
+            "workers did not probe the seeded live addr"
+        );
+        assert_eq!(
+            frontier_count.load(Ordering::Relaxed),
+            0,
+            "share=1.0 sent a frontier sample"
+        );
+        live_task.abort();
+        frontier_task.abort();
+        node.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sampler_share_zero_samples_only_frontier() {
+    timeout(Duration::from_secs(60), async {
+        // share = 0.0: workers must sample the frontier even with a
+        // seeded ring, and the seeded live addr — a stranger the node
+        // otherwise never contacts — must hear nothing at all.
+        let (node, _rx) = start(DhtConfig {
+            sampler: true,
+            tuning: DhtTuning {
+                sampler_live_share: 0.0,
+                ..fast_tuning()
+            },
+            ..config(&[])
+        })
+        .await;
+        let to = addr(&node);
+        let live = RawClient::new().await;
+        node.note_live_addr(live.addr());
+        let mut frontier = RawClient::new().await;
+        frontier.call(to, Method::Ping).await;
+        let (live_count, live_task) = counting_responder(live);
+        let (frontier_count, frontier_task) = counting_responder(frontier);
+        wait_until("frontier samples to arrive", Duration::from_secs(15), || {
+            frontier_count.load(Ordering::Relaxed) >= 1
+        })
+        .await;
+        sleep(Duration::from_secs(2)).await;
+        assert!(
+            frontier_count.load(Ordering::Relaxed) >= 1,
+            "workers did not sample the frontier"
+        );
+        assert_eq!(
+            live_count.load(Ordering::Relaxed),
+            0,
+            "share=0.0 probed the live ring"
+        );
+        live_task.abort();
+        frontier_task.abort();
+        node.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sampler_share_one_with_empty_ring_falls_back_to_frontier() {
+    timeout(Duration::from_secs(60), async {
+        // share = 1.0 with an empty ring (cold start): the worker must
+        // degrade to the frontier — and never panic. A panic in the
+        // live-probe branch would kill the workers and no sample would
+        // ever arrive, so the positive assertion is the no-panic proof.
+        let (node, _rx) = start(DhtConfig {
+            sampler: true,
+            tuning: DhtTuning {
+                sampler_live_share: 1.0,
+                ..fast_tuning()
+            },
+            ..config(&[])
+        })
+        .await;
+        let to = addr(&node);
+        let mut frontier = RawClient::new().await;
+        frontier.call(to, Method::Ping).await;
+        let (frontier_count, frontier_task) = counting_responder(frontier);
+        wait_until(
+            "a frontier sample despite the empty ring",
+            Duration::from_secs(15),
+            || frontier_count.load(Ordering::Relaxed) >= 1,
+        )
+        .await;
+        assert!(
+            frontier_count.load(Ordering::Relaxed) >= 1,
+            "empty ring with share=1.0 sampled nothing"
+        );
+        frontier_task.abort();
+        node.shutdown().await;
     })
     .await
     .expect("test timed out");

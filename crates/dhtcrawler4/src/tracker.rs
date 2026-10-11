@@ -30,6 +30,13 @@
 //!   cannot be fetched — set an `http://` URL to enable refresh.
 //! - Selection uses one OS-seeded RNG per pool (see `TrackerPool`), not
 //!   per key.
+//! - One socket per pool, not per tracker (fewer FDs, same pipelining).
+//! - First-seen addresses start live optimistically (no blocking probe
+//!   at startup); traffic verdicts + the hourly sweep evict the dead.
+//! - Announce selection is filter-then-sample over unfloored servers, so
+//!   one floored draw never blocks unfloored capacity.
+//! - Scrape flushes charge 2 packets/server (connect + scrape floor;
+//!   retries uncounted); announces charge 2/server.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -37,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use dc4_core::DhtKey;
 use dc4_tracker::{LiveServer, TrackerPool, parse_list};
-use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CrawlConfig;
@@ -281,7 +288,10 @@ impl<S: CrawlStore> TrackerHandle<S> {
             }
             return;
         }
-        self.budget.acquire(servers.len()).await;
+        // One scrape costs (at least) a connect plus the scrape itself per
+        // server; retries/re-handshakes cost more and are uncounted, so
+        // charge 2/server as the floor rather than 1.
+        self.budget.acquire(servers.len() * 2).await;
         let (seeders, outcomes, per_server) = self.pool.scrape(&servers, &keys).await;
         for (label, ok) in &outcomes {
             metrics::counter!(METRIC_SCRAPES, "tracker" => label.clone()).increment(1);
@@ -326,21 +336,24 @@ impl<S: CrawlStore> TrackerHandle<S> {
                 .increment(1);
             return Vec::new();
         }
-        let servers = self.pool.pick_live(self.tuning.announces_per_key as usize);
+        let servers =
+            self.pool
+                .pick_live_unfloored(&key, self.tuning.announces_per_key as usize, now);
         if servers.is_empty() {
-            metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "no_live")
-                .increment(1);
+            // Either no live servers (DHT-only fallback) or every live
+            // server is floored for this key (retry cooldown). Both are
+            // counted `floored` except the truly-empty set below: keep
+            // the distinction so `no_live` still means the pool is quiet.
+            if self.pool.live_count() == 0 {
+                metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "no_live")
+                    .increment(1);
+            } else {
+                metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "floored")
+                    .increment(1);
+            }
             return Vec::new();
         }
-        let live: Vec<LiveServer> = servers
-            .into_iter()
-            .filter(|s| !self.pool.tracker_floored(&key, &s.label, now))
-            .collect();
-        if live.is_empty() {
-            metrics::counter!(METRIC_ANNOUNCES, "tracker" => "none", "outcome" => "floored")
-                .increment(1);
-            return Vec::new();
-        }
+        let live = servers;
         // Bound concurrent announces pool-wide (spec's ~32 worker pool).
         let sem = self.announce_sem.clone();
         let Ok(_permit) = sem.acquire_owned().await else {
@@ -463,8 +476,7 @@ mod tests {
                         r[0..4].copy_from_slice(&2u32.to_be_bytes());
                         r[4..8].copy_from_slice(&txn.to_be_bytes());
                         for i in 0..n {
-                            r[8 + 12 * i..12 + 12 * i]
-                                .copy_from_slice(&seeders.to_be_bytes());
+                            r[8 + 12 * i..12 + 12 * i].copy_from_slice(&seeders.to_be_bytes());
                         }
                         sock.send_to(&r, from).await.unwrap();
                     }
@@ -552,6 +564,34 @@ mod tests {
         assert_eq!(verdict, None, "empty-servers flush resolves DHT-only");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_keeps_last_set() {
+        // WS5: a failing list refresh must keep serving the last known set,
+        // never clear it. The driver only calls `set_servers` on `Ok`, so a
+        // refused connection leaves the pool untouched across ticks.
+        let peer: SocketAddr = "10.9.0.3:6881".parse().unwrap();
+        let mock = mock_tracker(4, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        assert_eq!(h.pool.live_count(), 1, "mock starts optimistically live");
+        let stop = CancellationToken::new();
+        let driver = tokio::spawn(h.clone().run_refresh(
+            "http://127.0.0.1:1/nonexistent.txt".to_string(),
+            Duration::from_secs(1),
+            stop.clone(),
+        ));
+        // Several ticks fire; every fetch fails fast (connection refused).
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        stop.cancel();
+        driver.await.unwrap();
+        assert_eq!(
+            h.pool.live_count(),
+            1,
+            "failed refreshes must keep the last set"
+        );
+    }
+
     #[tokio::test]
     async fn announce_skips_keys_that_already_yielded_peers() {
         let peer: SocketAddr = "10.9.0.3:6881".parse().unwrap();
@@ -563,10 +603,7 @@ mod tests {
         let first = h.announce_peers(key).await;
         assert_eq!(first, vec![peer]);
         let second = h.announce_peers(key).await;
-        assert!(
-            second.is_empty(),
-            "peer-yielding keys are not re-announced"
-        );
+        assert!(second.is_empty(), "peer-yielding keys are not re-announced");
     }
 
     #[tokio::test]
@@ -580,5 +617,75 @@ mod tests {
             .await
             .expect("zero-seeder batch must still resolve");
         assert_eq!(verdict, Some(0), "zero seeders is a verdict (DHT-only)");
+    }
+
+    #[tokio::test]
+    async fn batcher_size_trigger_flushes_a_full_batch() {
+        // 74 concurrent triage calls fill one datagram (BATCH_KEYS): every
+        // key must resolve via the size trigger, so no key waits for the
+        // 200 ms timeout path and none is left behind.
+        let peer: SocketAddr = "10.9.0.5:6881".parse().unwrap();
+        let mock = mock_tracker(6, peer).await;
+        let h = TrackerHandle::start(&handle_config(mock), MemoryStore::new())
+            .await
+            .unwrap();
+        let keys: Vec<DhtKey> = (0..BATCH_KEYS)
+            .map(|i| {
+                let mut b = [0xbu8; 20];
+                b[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                DhtKey(b)
+            })
+            .collect();
+        let futs: Vec<_> = keys.iter().map(|k| h.triage(*k)).collect();
+        let verdicts =
+            tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(futs))
+                .await
+                .expect("a full batch must flush on size, not hang");
+        assert_eq!(verdicts.len(), BATCH_KEYS);
+        assert!(
+            verdicts.iter().all(|v| *v == Some(6)),
+            "every key in the full batch resolves, got {verdicts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_refreshes_seeders_est_for_retry_priority() {
+        // Scrape-triage must write the verdict back via
+        // `note_fetch_estimate`: the claim queue orders by
+        // (attempts, seeders_est), so triage sharpens retry priority.
+        use crate::stores::CrawlStore;
+        use dc4_store::Observation;
+        let peer: SocketAddr = "10.9.0.6:6881".parse().unwrap();
+        let mock = mock_tracker(9, peer).await;
+        let store = MemoryStore::new();
+        let key = DhtKey([0xcc; 20]);
+        store
+            .observe(
+                &[Observation {
+                    key,
+                    sightings: 1,
+                    priority: false,
+                }],
+                10,
+            )
+            .await
+            .unwrap();
+        let h = TrackerHandle::start(&handle_config(mock), store.clone())
+            .await
+            .unwrap();
+        let verdict = tokio::time::timeout(Duration::from_secs(10), h.triage(key))
+            .await
+            .expect("triage must resolve");
+        assert_eq!(verdict, Some(9));
+        let claimed = store.claim(10, Duration::from_secs(120)).await.unwrap();
+        let got = claimed
+            .iter()
+            .find(|i| i.dht_key == key)
+            .expect("key pending");
+        assert_eq!(
+            got.seeders_est,
+            Some(9),
+            "triage verdict must refresh the piggybacked estimate"
+        );
     }
 }

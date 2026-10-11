@@ -2051,4 +2051,30 @@ mod tests {
         }
         drop(holder);
     }
+
+    #[tokio::test]
+    async fn bind_sockets_derives_consecutive_ports_from_base() {
+        // WS4: identity i binds `dht_port + i` (not N copies of one port).
+        // Probe high ports for a free consecutive pair; skip the assert
+        // only if the box has no free pair in the probe window.
+        for base in (48100u16..48300).step_by(4) {
+            let mut cfg = DhtConfig::default();
+            cfg.bind_v4 = Some(SocketAddr::new("127.0.0.1".parse().unwrap(), base));
+            cfg.bind_v6 = None;
+            cfg.identities = 2;
+            let bound = match bind_sockets(&cfg) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            assert_eq!(bound.len(), 2);
+            let mut ports: Vec<u16> = bound.iter().map(|(_, _, local)| local.port()).collect();
+            ports.sort_unstable();
+            assert_eq!(
+                ports,
+                vec![base, base.wrapping_add(1)],
+                "identity ports must derive as base+i"
+            );
+            return;
+        }
+    }
 }

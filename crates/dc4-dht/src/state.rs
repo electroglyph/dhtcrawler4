@@ -179,6 +179,55 @@ mod tests {
     }
 
     #[test]
+    fn multi_identity_round_trip_preserves_order() {
+        // WS4: N identities persist in bind order; a restart reloads entry
+        // i for socket i, so survivors keep reputation and new identities
+        // generate once. Pin the order, not just the set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dht.json");
+        let state = StateFile {
+            version: STATE_VERSION,
+            v4: vec![
+                IdentityState {
+                    id: NodeId([0x11; 20]),
+                    external_ip: None,
+                    nodes: vec![],
+                },
+                IdentityState {
+                    id: NodeId([0x22; 20]),
+                    external_ip: None,
+                    nodes: vec![],
+                },
+                IdentityState {
+                    id: NodeId([0x33; 20]),
+                    external_ip: None,
+                    nodes: vec![],
+                },
+            ],
+            v6: vec![],
+        };
+        save(&path, &state).unwrap();
+        let loaded = load(&path).expect("multi-identity state must load");
+        assert_eq!(loaded.v4.len(), 3);
+        assert_eq!(loaded.v4[0].id, NodeId([0x11; 20]));
+        assert_eq!(loaded.v4[1].id, NodeId([0x22; 20]));
+        assert_eq!(loaded.v4[2].id, NodeId([0x33; 20]));
+        // Prefix upgrade (N=1 file, N=3 boot): index 0 keeps its ID.
+        let grown = StateFile {
+            version: STATE_VERSION,
+            v4: vec![IdentityState {
+                id: NodeId([0x11; 20]),
+                external_ip: None,
+                nodes: vec![],
+            }],
+            v6: vec![],
+        };
+        save(&path, &grown).unwrap();
+        let reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.v4[0].id, NodeId([0x11; 20]));
+    }
+
+    #[test]
     fn bad_files_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dht.json");

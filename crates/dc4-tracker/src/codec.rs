@@ -107,7 +107,10 @@ pub fn encode_announce(
     out.extend_from_slice(&key.0);
     out.extend_from_slice(peer_id);
     out.extend_from_slice(&0u64.to_be_bytes()); // downloaded
-    out.extend_from_slice(&0u64.to_be_bytes()); // left (unknown)
+    // left: we hold no bytes, so advertise as a leecher. 0 would claim
+    // seeder (complete) and pollute tracker seeder stats; the exact
+    // amount is irrelevant since we never serve.
+    out.extend_from_slice(&1u64.to_be_bytes()); // left (leecher)
     out.extend_from_slice(&0u64.to_be_bytes()); // uploaded
     out.extend_from_slice(&EVENT_STARTED.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // ip (default)
@@ -239,6 +242,14 @@ mod tests {
         assert_eq!(&req[80..84], &EVENT_STARTED.to_be_bytes());
         assert_eq!(&req[92..96], &ANNOUNCE_NUM_WANT.to_be_bytes());
         assert_eq!(&req[96..98], &6881u16.to_be_bytes());
+        // Layout: downloaded 56..64, left 64..72, uploaded 72..80.
+        assert_eq!(&req[56..64], &0u64.to_be_bytes(), "downloaded");
+        assert_eq!(
+            u64::from_be_bytes(req[64..72].try_into().unwrap()),
+            1,
+            "left must be nonzero (leecher): 0 would falsely claim seeder"
+        );
+        assert_eq!(&req[72..80], &0u64.to_be_bytes(), "uploaded");
         // Reply: interval + leechers + seeders + two peers (one port-0).
         let mut reply = vec![0u8; 20 + 12];
         reply[0..4].copy_from_slice(&1u32.to_be_bytes());
@@ -289,5 +300,145 @@ mod tests {
         reply[3] = 1;
         assert_eq!(error_text(&reply), None);
         assert_eq!(error_text(&reply[..4]), None);
+    }
+
+    /// Hex-decodes a literal packet. Panics on odd length or bad digits;
+    /// test-only, so a panic is the assertion.
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "odd-length hex literal");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("bad hex"))
+            .collect()
+    }
+
+    #[test]
+    fn wire_vectors_match_bep15_byte_for_byte() {
+        // Every literal below was written out by hand from the BEP 15
+        // layout, independent of the encoder: if any field drifts (magic,
+        // action, order, width, endianness) the whole-packet comparison
+        // fails. A round-trip test cannot catch that — an encoder bug
+        // mirrored in the decoder would pass — so these vectors pin the
+        // wire format, not just self-consistency.
+        //
+        // Connect request: magic 0x41727101980, action 0, txn 0x04030201.
+        let req = encode_connect(0x0403_0201);
+        assert_eq!(
+            req.as_slice(),
+            unhex(concat!(
+                "0000041727101980", // magic 0x41727101980
+                "00000000", // action: connect
+                "04030201", // txn
+            ))
+            .as_slice()
+        );
+
+        // Scrape request: conn 0x0102..08, action 2, txn 0x0a0b0c0d,
+        // then two infohashes with sequential bytes 0x00-0x13, 0x14-0x27.
+        let keys = [
+            DhtKey(std::array::from_fn(|i| i as u8)),
+            DhtKey(std::array::from_fn(|i| (20 + i) as u8)),
+        ];
+        let req = encode_scrape(0x0102_0304_0506_0708, 0x0a0b_0c0d, &keys);
+        assert_eq!(req.len(), 16 + 2 * 20);
+        assert_eq!(
+            req,
+            unhex(concat!(
+                "0102030405060708", // connection id
+                "00000002", // action: scrape
+                "0a0b0c0d", // txn
+                "000102030405060708090a0b0c0d0e0f10111213", // key 1
+                "1415161718191a1b1c1d1e1f2021222324252627", // key 2
+            ))
+        );
+
+        // Announce request: fixed key (0xaa * 20), peer id (0xbb * 20),
+        // port 6881. Bytes 88..92 are the random per-request key, so the
+        // literal pins all 96 other bytes and the total length.
+        let req = encode_announce(
+            0x0102_0304_0506_0708,
+            0x0a0b_0c0d,
+            &DhtKey([0xaa; 20]),
+            &[0xbb; 20],
+            6881,
+        );
+        assert_eq!(req.len(), 100);
+        assert_eq!(
+            &req[..88],
+            unhex(concat!(
+                "0102030405060708", // connection id
+                "00000001", // action: announce
+                "0a0b0c0d", // txn
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // infohash
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", // peer id
+                "0000000000000000", // downloaded
+                "0000000000000001", // left: leecher, never 0 (seeder)
+                "0000000000000000", // uploaded
+                "00000002", // event: started
+                "00000000", // ip: default
+            ))
+            .as_slice()
+        );
+        assert_eq!(
+            &req[92..],
+            unhex(concat!(
+                "000000c8", // num_want: 200
+                "1ae1", // port: 6881
+                "0000", // extensions
+            ))
+            .as_slice()
+        );
+
+        // Connect reply: action 0, txn, connection id.
+        let reply = unhex(concat!(
+            "00000000", // action: connect
+            "0a0b0c0d", // txn
+            "0102030405060708", // connection id
+        ));
+        assert_eq!(decode_connect(&reply), Some(0x0102_0304_0506_0708));
+
+        // Scrape reply: action 2, txn, two 12-byte rows
+        // (seeders, completed, leechers).
+        let reply = unhex(concat!(
+            "00000002", // action: scrape
+            "0a0b0c0d", // txn
+            "00000001", "00000002", "00000003", // row 1: 1/2/3
+            "00000000", "00000000", "00000000", // row 2: zeros
+        ));
+        assert_eq!(
+            decode_scrape(&reply, 74),
+            Some(vec![
+                ScrapeRow {
+                    seeders: 1,
+                    completed: 2,
+                    leechers: 3
+                },
+                ScrapeRow::default(),
+            ])
+        );
+
+        // Announce reply: action 1, txn, interval 1800, 4-byte
+        // leechers/seeders counts, then compact peers; the port-0 peer
+        // is dropped.
+        let reply = unhex(concat!(
+            "00000001", // action: announce
+            "0a0b0c0d", // txn
+            "00000708", // interval: 1800
+            "00000005", // leechers
+            "00000007", // seeders
+            "01020304", "1ae1", // 1.2.3.4:6881
+            "05060708", "0000", // 5.6.7.8:0 (dropped)
+        ));
+        let out = decode_announce(&reply).expect("literal announce reply");
+        assert_eq!(out.interval_secs, 1800);
+        assert_eq!(out.peers, vec!["1.2.3.4:6881".parse().unwrap()]);
+
+        // Error reply: action 3, txn, raw message text.
+        let mut reply = unhex(concat!(
+            "00000003", // action: error
+            "0a0b0c0d", // txn
+        ));
+        reply.extend_from_slice(b"failure reason");
+        assert_eq!(error_text(&reply).as_deref(), Some("failure reason"));
     }
 }

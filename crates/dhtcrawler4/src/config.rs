@@ -991,10 +991,9 @@ impl Config {
         }
         if !c.tracker_list_url.trim().is_empty()
             && !c.tracker_list_url.starts_with("http://")
-            && !c.tracker_list_url.starts_with("https://")
         {
             return Err(invalid(
-                "crawl.tracker_list_url must be empty or an http(s) URL",
+                "crawl.tracker_list_url must be empty or a plain-http URL (no TLS client; https cannot be fetched — point it at an http:// mirror or leave it empty)",
             ));
         }
         check_range(
@@ -1701,6 +1700,7 @@ mod tests {
             ("DC4_CRAWL__TRACKERS", "http://x.example:1/a"),
             ("DC4_CRAWL__TRACKERS", "udp://x.example:0"),
             ("DC4_CRAWL__TRACKER_LIST_URL", "ftp://x.example/list"),
+            ("DC4_CRAWL__TRACKER_LIST_URL", "https://x.example/list.txt"),
             ("DC4_CRAWL__TRACKER_LIST_REFRESH_SECS", "3599"),
             ("DC4_CRAWL__TRACKER_ANNOUNCES_PER_KEY", "0"),
             ("DC4_CRAWL__TRACKER_ANNOUNCES_PER_KEY", "9"),

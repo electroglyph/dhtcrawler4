@@ -95,6 +95,11 @@ pub const METRIC_HINT_ADDED: &str = "dc4_hint_added_total";
 /// Hint peers consumed by fetch, by outcome: `dialed` (queued), `filtered`
 /// (re-filter/repeat dropped), `empty` (no hints for the key).
 pub const METRIC_HINT_USED: &str = "dc4_hint_used_total";
+/// Age of a consumed hint at take time, in seconds: `now - added_at` for
+/// each unexpired hint `take` returns. The p50 decides the `HINT_TTL`
+/// review (5 min today, 15 min if p50 exceeds TTL) — without it the bump
+/// decision has no signal.
+pub const METRIC_HINT_AGE: &str = "dc4_hint_age_seconds";
 
 /// Capacities of zero are rejected loudly: a zero-capacity LRU cannot exist,
 /// so silently running with room for one key would be a worse surprise.
@@ -399,6 +404,8 @@ impl HintMap {
     }
 
     /// Removes and returns the unexpired hints for `key`, newest first.
+    /// Each returned hint also observes its age (`now - added_at`) into
+    /// `dc4_hint_age_seconds`, so the TTL review has a p50 signal.
     pub fn take(&mut self, key: &DhtKey, now: Instant) -> Vec<SocketAddr> {
         let ttl = self.ttl;
         self.map
@@ -407,7 +414,11 @@ impl HintMap {
             .into_iter()
             .rev()
             .filter(|(_, at)| now.saturating_duration_since(*at) < ttl)
-            .map(|(p, _)| p)
+            .map(|(p, at)| {
+                metrics::histogram!(METRIC_HINT_AGE)
+                    .record(now.saturating_duration_since(at).as_secs_f64());
+                p
+            })
             .collect()
     }
 
@@ -1595,6 +1606,15 @@ mod tests {
             t0,
         );
         assert_eq!(take_hints(&a.hints, &k, t0), vec![sa("8.8.8.8:6881")]);
+    }
+
+    #[test]
+    fn hint_metric_names_are_stable() {
+        // Exporter dashboards and alert rules match on these names; a rename
+        // must be deliberate. Mirrors the lookup-duration pin in peers.rs.
+        assert_eq!(METRIC_HINT_ADDED, "dc4_hint_added_total");
+        assert_eq!(METRIC_HINT_USED, "dc4_hint_used_total");
+        assert_eq!(METRIC_HINT_AGE, "dc4_hint_age_seconds");
     }
 
     #[tokio::test(start_paused = true)]

@@ -25,7 +25,7 @@ use dc4_core::DhtKey;
 use lru::LruCache;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::IndexedRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
@@ -229,6 +229,53 @@ impl TrackerPool {
                 addr: *a,
             })
             .collect()
+    }
+
+    /// Uniform random subset of the live set excluding per-tracker floored
+    /// candidates for `key`: filter-then-sample, so a retry tries unfloored
+    /// trackers instead of drawing a floored subset and giving up while
+    /// unfloored servers sit idle. Returns at most `k`.
+    pub fn pick_live_unfloored(&self, key: &DhtKey, k: usize, now: Instant) -> Vec<LiveServer> {
+        if k == 0 {
+            return Vec::new();
+        }
+        // Snapshot first so no lock is held while `tracker_floored`
+        // takes the memo lock per candidate.
+        let candidates: Vec<LiveServer> = {
+            let set = lock(&self.servers);
+            set.live
+                .iter()
+                .map(|a| LiveServer {
+                    label: set.label_of(a),
+                    addr: *a,
+                })
+                .collect()
+        };
+        let mut eligible: Vec<LiveServer> = candidates
+            .into_iter()
+            .filter(|s| !self.tracker_floored(key, &s.label, now))
+            .collect();
+        if eligible.is_empty() {
+            return Vec::new();
+        }
+        let mut rng = lock(&self.rng);
+        if eligible.len() <= k {
+            // Shuffle, don't just truncate: callers must not prefer the
+            // hash-set order of the first k.
+            eligible.shuffle(&mut *rng);
+            return eligible;
+        }
+        eligible.choose_multiple(&mut *rng, k).cloned().collect()
+    }
+
+    /// Marks (`key`, `label`) floored (tests): drives
+    /// filter-then-sample tests without network timeouts.
+    #[cfg(test)]
+    fn floor_for_test(&self, key: &DhtKey, label: &str) {
+        lock(&self.announced_by_tracker).put(
+            (*key, label.to_owned()),
+            (Instant::now(), MIN_ANNOUNCE_FLOOR, 0),
+        );
     }
 
     /// Pins the pool RNG (tests): deterministic selection afterwards.
@@ -689,7 +736,10 @@ mod tests {
             .await
             .unwrap();
         assert!(pool.pick_live(3).is_empty(), "empty live set picks empty");
-        assert!(pool.pick_live(0).is_empty(), "k=0 picks empty even when live");
+        assert!(
+            pool.pick_live(0).is_empty(),
+            "k=0 picks empty even when live"
+        );
         let addrs: Vec<SocketAddr> = (0..5)
             .map(|i| SocketAddr::from(([10, 0, 0, 1], 6900 + i)))
             .collect();
@@ -716,6 +766,74 @@ mod tests {
         );
         let all = pool.pick_live(99);
         assert_eq!(all.len(), 5, "k larger than live returns what is live");
+    }
+
+    #[tokio::test]
+    async fn unfloored_pick_skips_floored_servers() {
+        // Filter-then-sample: with 3 live servers and 2 floored for the
+        // key, a k=1 pick must return the 1 unfloored server (not draw a
+        // floored singleton and report "floored" while capacity idles).
+        let pool = TrackerPool::start(Vec::new(), 6881, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| SocketAddr::from(([10, 1, 0, 1], 6950 + i)))
+            .collect();
+        {
+            let mut set = lock(&pool.servers);
+            for (i, a) in addrs.iter().enumerate() {
+                set.servers.push(ResolvedServer {
+                    label: format!("t{i}"),
+                    addrs: vec![*a],
+                });
+                set.live.insert(*a);
+            }
+        }
+        let key = DhtKey([0xaa; 20]);
+        pool.floor_for_test(&key, "t0");
+        pool.floor_for_test(&key, "t1");
+        for seed in [1u64, 7, 42, 999] {
+            pool.seed_rng(seed);
+            let picked = pool.pick_live_unfloored(&key, 1, Instant::now());
+            assert_eq!(
+                picked.len(),
+                1,
+                "seed {seed}: one unfloored server must be picked"
+            );
+            assert_eq!(picked[0].label, "t2");
+        }
+        // All floored -> empty (retry cooldown), not a floored draw.
+        pool.floor_for_test(&key, "t2");
+        pool.seed_rng(42);
+        assert!(pool.pick_live_unfloored(&key, 1, Instant::now()).is_empty());
+        // A different key is unaffected by this key's floors.
+        pool.seed_rng(42);
+        assert_eq!(
+            pool.pick_live_unfloored(&DhtKey([0xbb; 20]), 1, Instant::now())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn new_addrs_start_live_until_traffic_proves_otherwise() {
+        // `set_servers` marks first-seen addresses live optimistically
+        // (no blocking connect probe on sight — the pool would stall
+        // startup on 17 handshakes); scrape/announce verdicts plus the
+        // hourly sweep then strike dead ones out. Pin the optimistic
+        // start so a refactor cannot silently flip to start-dead (which
+        // would idle the pool until the first sweep).
+        let pool = TrackerPool::start(Vec::new(), 6881, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let (entries, _, _) = parse_list("udp://127.0.0.1:6881\nudp://127.0.0.1:6882\n");
+        pool.set_servers(entries).await;
+        assert_eq!(pool.known_count(), 2);
+        assert_eq!(
+            pool.live_count(),
+            2,
+            "first-seen addrs start live; traffic/sweep evicts the dead"
+        );
     }
 
     #[test]
@@ -763,7 +881,10 @@ mod tests {
             set.live.insert(tracker_addr);
         }
         let first = pool.connect(tracker_addr).await.expect("handshake");
-        pool.backdate_conn_for_test(tracker_addr, Instant::now() - CONN_TTL - Duration::from_secs(1));
+        pool.backdate_conn_for_test(
+            tracker_addr,
+            Instant::now() - CONN_TTL - Duration::from_secs(1),
+        );
         let second = pool.connect(tracker_addr).await.expect("refresh");
         assert_ne!(first, second, "expired ID must re-handshake, not reuse");
     }
@@ -805,7 +926,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The live sweep cached a connection ID: force expiry so the next
         // sweeps really probe the (now dead) port instead of reusing it.
-        pool.backdate_conn_for_test(tracker_addr, Instant::now() - CONN_TTL - Duration::from_secs(1));
+        pool.backdate_conn_for_test(
+            tracker_addr,
+            Instant::now() - CONN_TTL - Duration::from_secs(1),
+        );
         pool.sweep().await;
         assert_eq!(pool.live_count(), 1, "one failure strikes but keeps live");
         pool.sweep().await;

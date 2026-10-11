@@ -88,8 +88,10 @@ pub fn check_config(cfg: &Config, out: Out<'_>) -> Result<(), AdminError> {
     let warnings = cfg.warnings();
     writeln!(
         out,
-        "# packet budgets: crawl {}/s + scrape {}/s (separate buckets)",
-        cfg.crawl.max_packets_per_sec, cfg.crawl.scrape_packets_per_sec
+        "# packet budgets: crawl {}/s + fetch {}/s + scrape {}/s (separate buckets)",
+        cfg.crawl.max_packets_per_sec,
+        cfg.crawl.fetch_packets_per_sec,
+        cfg.crawl.scrape_packets_per_sec
     )?;
     if warnings.is_empty() {
         writeln!(out, "# no warnings")?;
@@ -139,6 +141,14 @@ mod tests {
         assert!(
             text.contains("password from /run/secrets/db_password"),
             "{text}"
+        );
+        assert!(
+            text.contains("# packet budgets: crawl "),
+            "footer must name the budgets: {text}"
+        );
+        assert!(
+            text.contains("+ fetch ") && text.contains("+ scrape "),
+            "footer must list all three separate buckets (crawl/fetch/scrape): {text}"
         );
         // The printed configuration parses back to the same values.
         let body: String = text

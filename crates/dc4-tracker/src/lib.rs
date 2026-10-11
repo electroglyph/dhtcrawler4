@@ -22,7 +22,12 @@
 //! refresh speaks plain HTTP only (no TLS client, so the spec's `https://`
 //! default URL is off by default — set an `http://` URL to enable);
 //! announces run inline on fetch workers throttled by the packet budget
-//! plus a 32-permit semaphore, not on a dedicated 32-task pool.
+//! plus a 32-permit semaphore, not on a dedicated 32-task pool; one
+//! socket per pool (fewer FDs than one-per-tracker, same pipelining);
+//! first-seen addresses start live optimistically — no blocking connect
+//! probe at startup — and scrape/announce verdicts plus the hourly sweep
+//! evict the dead; announces carry `left=1` (leecher, never seeder `0`);
+//! announce selection is filter-then-sample over unfloored servers.
 
 pub mod client;
 pub mod codec;
