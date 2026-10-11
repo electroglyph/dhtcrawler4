@@ -1,0 +1,7 @@
+services:
+  crawl:
+    environment:
+      DC4_CRAWL__SAMPLER_CONCURRENCY: "256"
+      DC4_CRAWL__MAX_PACKETS_PER_SEC: "6000"
+      DC4_CRAWL__SCRAPE_SWEEP_SECS: "600"
+      DC4_DATABASE__MAX_CONNECTIONS: "32"
