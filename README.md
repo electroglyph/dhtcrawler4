@@ -786,7 +786,13 @@ How to read the output:
   climbing once per sweep proves the hourly corpse purge runs; flat at
   zero an hour after a restart means the sweep is not firing. While corpses
   pile up, `dc4_blocked_total{reason="queue_full"}` climbs — that stops once
-  the purge catches depth below the cap.
+  the purge catches depth below the cap. Announced-peer direct dials show as
+  `dc4_hint_used_total{outcome="dialed"}`; `empty` dominating means the gap
+  is upstream (adds, see `dc4_hint_added_total{source}` vs
+  `dc4_blocked_total{reason="peer_address"}` filter drops), and traversal
+  peers feeding retries is expected (`dialed` without a matching add means
+  retries are working). `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
+  the fetch-budget health signal.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches

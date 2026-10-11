@@ -35,7 +35,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::{SharedHints, take_hints};
+use crate::admission::{METRIC_HINT_USED, SharedHints, add_hint, take_hints};
 use crate::peers::{OwnAddrs, PeerFilter, PeerSource};
 use crate::stores::CrawlStore;
 
@@ -901,11 +901,19 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
         let mut own = OwnAddrs::of(&self.peers);
         let mut queue: VecDeque<SocketAddr> = VecDeque::new();
         let mut seen: HashSet<SocketAddr> = HashSet::new();
-        for peer in take_hints(&self.hints, &key, Instant::now()) {
-            if let Some(peer) = self.filter.accept(peer, &own)
-                && seen.insert(peer)
-            {
-                queue.push_back(peer);
+        let hinted = take_hints(&self.hints, &key, Instant::now());
+        if hinted.is_empty() {
+            metrics::counter!(METRIC_HINT_USED, "outcome" => "empty").increment(1);
+        }
+        for peer in hinted {
+            match self.filter.accept(peer, &own) {
+                Some(peer) if seen.insert(peer) => {
+                    metrics::counter!(METRIC_HINT_USED, "outcome" => "dialed").increment(1);
+                    queue.push_back(peer);
+                }
+                _ => {
+                    metrics::counter!(METRIC_HINT_USED, "outcome" => "filtered").increment(1);
+                }
             }
         }
         // Boxed so a high-estimate key can run a second lookup after the
@@ -985,6 +993,14 @@ impl<S: CrawlStore, P: PeerSource> Fetcher<S, P> {
                         if let Some(peer) = self.filter.accept(peer, &own)
                             && seen.insert(peer)
                         {
+                            // traversal-found peers become retry
+                            // hints (bounded 8/key by `HintMap::add`), so a
+                            // failed attempt's retry dials known-good peers
+                            // first instead of re-traversing from scratch.
+                            // `take` is destructive, so these survive only
+                            // for the NEXT `obtain()` — this one already
+                            // holds them in `seen`, no double-dial.
+                            add_hint(&self.hints, key, peer, Instant::now());
                             queue.push_back(peer);
                         }
                     }
@@ -2165,6 +2181,35 @@ mod tests {
             assert_eq!(peers.calls(), 1, "est {est:?}: one lookup");
             assert_eq!(dial_count(&counters), 3, "est {est:?}: three dials");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traversal_peers_become_retry_hints() {
+        // lookup-found peers are recorded into the HintMap, so
+        // a retry dials known-good peers first. The counting listener
+        // accepts then drops: every dial fails fast at the handshake.
+        let store = MemoryStore::new();
+        let hints = shared_hints(&AdmissionTuning::default());
+        let (addr, dials) = counting_listener().await;
+        let peers = ScriptedLookups::new(vec![vec![addr]]);
+        let f = fetcher_with_hints(&store, peers, test_tuning(), hints.clone());
+        let k = DhtKey([77; 20]);
+        assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+        let before = dials.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(before > 0, "first obtain dials the found peer");
+        // The found peer survived as a retry hint despite dial failure
+        // (non-destructive check: `take_hints` drains).
+        assert_eq!(hints.lock().unwrap().len(), 1);
+        // Second obtain: the (script-exhausted, peerless) lookup returns
+        // nothing, but the hint seeds the queue — dials happen anyway, and
+        // the `seen` dedupe in `obtain()` still holds (no double queueing).
+        assert!(matches!(f.obtain(k, None).await, Obtained::Failed));
+        assert!(
+            dials.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "retry dials the hinted peer without traversal peers"
+        );
+        // The retry consumed the hint (destructive take).
+        assert!(hints.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

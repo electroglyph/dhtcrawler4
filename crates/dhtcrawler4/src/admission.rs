@@ -89,6 +89,12 @@ const METRIC_DISCOVERED: &str = "dc4_discovered_total";
 const METRIC_ADMITTED: &str = "dc4_admitted_total";
 /// Pipeline blocks, by reason (also used by `fetch`).
 pub const METRIC_BLOCKED: &str = "dc4_blocked_total";
+/// Hint peers recorded, by discovery source (answers whether
+/// hints carry yield or are vestigial).
+pub const METRIC_HINT_ADDED: &str = "dc4_hint_added_total";
+/// Hint peers consumed by fetch, by outcome: `dialed` (queued), `filtered`
+/// (re-filter/repeat dropped), `empty` (no hints for the key).
+pub const METRIC_HINT_USED: &str = "dc4_hint_used_total";
 
 /// Capacities of zero are rejected loudly: a zero-capacity LRU cannot exist,
 /// so silently running with room for one key would be a worse surprise.
@@ -429,6 +435,15 @@ pub fn take_hints(hints: &SharedHints, key: &DhtKey, now: Instant) -> Vec<Socket
     lock(hints).take(key, now)
 }
 
+/// Records one hint on a shared map (traversal-found peers
+/// become retry hints). Bounded by the same per-key cap as the add path;
+/// `get_peers`-sourced peers are deliberately NOT added at the admission
+/// add-path — they arrive through traversal and would double-dial there —
+/// only lookup-success peers recorded here, for the *next* `obtain()`.
+pub fn add_hint(hints: &SharedHints, key: DhtKey, peer: SocketAddr, now: Instant) {
+    lock(hints).add(key, peer, now);
+}
+
 // ---------------------------------------------------------------------------
 // Admission
 // ---------------------------------------------------------------------------
@@ -577,7 +592,11 @@ impl<S: CrawlStore> Admission<S> {
 
         if let Some(peer) = event.peer {
             match self.filter.accept(peer, own) {
-                Some(peer) => lock(&self.hints).add(event.key, peer, now),
+                Some(peer) => {
+                    lock(&self.hints).add(event.key, peer, now);
+                    metrics::counter!(METRIC_HINT_ADDED, "source" => source.as_str())
+                        .increment(1);
+                }
                 None => {
                     metrics::counter!(METRIC_BLOCKED, "reason" => "peer_address").increment(1);
                 }
