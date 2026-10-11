@@ -2,6 +2,10 @@
 
 Forked from upstream at `3350799` (2026-09-17, merge of Rust rewrite).
 
+## 0.6.2
+
+- Crawl (ops): tune discovery for junk-heavy swarms via the untracked compose override — sampler concurrency 1024→256, packet budget 12000→6000/s, purge sweep 3600→600 s, crawl pool 128→32 (PG `max_connections` stays 200). No code or default-config changes; `max_pending` 1M and sample corroboration stay conditional on the next diag.
+
 ## 0.6.1
 
 - Crawl: sampler concurrency 512→1024 (the enforced ceiling) and packet budget 6000→12000/s, fetch workers 1536→3072 with connections 6144→12288; compose sized for 12 GB boxes (crawl 6g, db 3g, pools 128/PG 200, 1 GiB inflight budget).

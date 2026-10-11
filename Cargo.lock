@@ -652,7 +652,7 @@ checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "dc4-bencode"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "proptest",
  "thiserror",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "data-encoding",
  "hex",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-dht"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "crc32c",
  "dc4-bencode",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-peer"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bytes",
  "dc4-bencode",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-search"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "dc4-core",
  "proptest",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-store"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "dc4-core",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-torrent"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "dc4-bencode",
  "dc4-core",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "dc4-web"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "askama",
  "askama_web",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "dhtcrawler4"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "axum",
