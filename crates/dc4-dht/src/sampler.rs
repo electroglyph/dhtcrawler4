@@ -493,6 +493,7 @@ impl LiveRing {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
