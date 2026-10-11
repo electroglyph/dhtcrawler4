@@ -23,7 +23,7 @@ dhtcrawler4 is a fork of [dhtcrawler3](https://github.com/poonasor/dhtcrawler3) 
 - **Retry hints:** peers found during a lookup are remembered (8 per key) so the retry dials known-good peers first instead of re-traversing; `dc4_hint_added/used_total` and `dc4_hint_age_seconds` show whether hints pay.
 - **Live-neighborhood sampling:** dhtcrawler3 sampled only by walking the routing-table frontier; now 25% of sampler picks query a known-live address directly; dead addresses evict after 3 failures. Kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`.
 - **Multi-identity operation:** dhtcrawler3 runs a single node ID; `crawl.identities` (1–8) runs several at once, each on its own UDP port (`dht_port + i`); lookups go out through the closest identity and fan out when it finds nothing. Start with 2–4, not 8.
-- **UDP tracker hybrid:** dhtcrawler3 is DHT-only; this fork also scrapes every claimed key at 2 random UDP trackers, and announces keys with seeders at 3 with a one-shot `started`; dead trackers mean DHT-only, nothing breaks. On by default; `tracker_enabled=false` turns it off. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation.
+- **UDP tracker hybrid:** dhtcrawler3 is DHT-only; this fork also scrapes every claimed key at 3 random UDP trackers, and announces keys with seeders at 5 with a one-shot `started`; dead trackers mean DHT-only, nothing breaks. On by default; `tracker_enabled=false` turns it off. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation.
 - **Store durability:** deleted torrents stay reported-as-deleted so slow indexers still converge, database permissions repair themselves on migrate, refetched torrents come back to life with their liveness data intact, and counters can't overflow.
 - **Cookie theme switch, still no JavaScript:** header dark/light toggle via `POST /theme` (`theme` cookie, dark default). Removed `/.well-known/security.txt` and the `web.base_url` setting (old configs must drop that key).
 - **Hardened DHT / parsing / fetch:** stricter peer identity and routing-table rules, IPv6 rate limits, memory-safe parsing of torrent files, and deadline + retry handling for metadata fetch.
@@ -686,8 +686,9 @@ docker compose start crawl index web
 off the host. To restore: `down`, fresh `pgdata` volume, extract the
 tarball into it, `up -d --build`.
 
-Reclaim build disk now and then: `docker builder prune -f` drops the
-superseded build cache (gigabytes per rebuild) and
+Reclaim build disk now and then: `docker builder prune -a -f` drops the
+superseded build cache (gigabytes per rebuild; without `-a` only dangling
+records go, which reclaims ~0) and
 `docker image prune -f` drops the superseded images (never prune volumes
 unless you mean to wipe the database and index — that flag is `-v`, keep
 it away from routine cleanup). For hands-free cleanup, run the prune weekly
@@ -695,7 +696,7 @@ from cron (as a user in the `docker` group, or root's crontab):
 
 ```sh
 # weekly sunday 04:00: prune unused build cache and images
-0 4 * * 0 docker builder prune -f && docker image prune -f
+0 4 * * 0 docker builder prune -a -f && docker image prune -f
 ```
 
 ## Troubleshooting
@@ -774,7 +775,8 @@ How to read the output:
   the pool pinned at zero is a slow query, not a small machine.
 - **Disk filling up?** `docker system df` first: gigabytes of reclaimable
   build cache is normal after repeated `--build` updates — `docker
-  builder prune -f` drops it. Otherwise `pgdata` is the big volume by
+  builder prune -a -f` drops it (without `-a` only dangling records go,
+  which reclaims ~0). Otherwise `pgdata` is the big volume by
   design (millions of queued keys plus WAL churn). Cross-check `du`
   against the SQL `db_size`: a large gap is WAL piled up or dead tuples,
   not data — look at `pg_wal` inside the volume and `n_dead_tup` in
@@ -817,7 +819,11 @@ How to read the output:
   Hint age at take time reports as `dc4_hint_age_seconds` — its p50 decides
   the `HINT_TTL` review (5 min today, 15 min if p50 exceeds TTL).
   `dc4_lookup_duration_seconds{kind="fetch"}` p99 is
-  the fetch-budget health signal. Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 5), `tracker_scrape_fanout` (1..=4, default 3), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 5). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
+  the fetch-budget health signal. `dc4_fetch_stage_seconds{stage}` splits
+  per-key worker time into `lookup`/`triage`/`dial`/`store`/`total` — the
+  stage with the biggest p50 is where throughput work goes; `total` counts
+  joined against `dc4_fetch_total` reveal the `key_deadline`-hit share
+  (dropped keys record nothing). Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 5), `tracker_scrape_fanout` (1..=4, default 3), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 5). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches
