@@ -4,6 +4,9 @@
 # `log` directive: search text is part of the URL, so an access log would store
 # visitors' IP addresses next to their queries (requirement R11).
 #
+# Single domain:   search.example.org {
+# Apex + www (one cert per name):   example.org, www.example.org {
+#
 # Run on the host:   caddy run --config deploy/Caddyfile
 # Then set web.hsts = true.
 

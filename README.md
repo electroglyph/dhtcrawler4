@@ -386,6 +386,26 @@ sudo iptables -A INPUT -p udp --dport 6881 -j ACCEPT  # DHT
 sudo iptables -P INPUT DROP
 ```
 
+`-A` appends. If the chain already contains a `REJECT` (Oracle base images
+ship one, and a second run of the block above adds one), new `ACCEPT`s land
+*after* it and never match (`0 packets` on the new rules, LE later fails with
+`Error getting validation data`). Inspect first and insert before the `REJECT`
+instead:
+
+```sh
+sudo iptables -L INPUT -n --line-numbers -v
+# want: ACCEPT 22, 80, 443, 6881/udp all *before* any REJECT, policy DROP.
+# If 80/443 sit after a REJECT, fix with (example: REJECT is line 5):
+sudo iptables -I INPUT 5 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 7 -p udp --dport 6881 -j ACCEPT
+sudo iptables -L INPUT -n --line-numbers -v   # re-check order, delete stale duplicates
+```
+
+Cloud firewalls are separate from `iptables`: on OCI the VCN security list /
+NSG must also allow ingress 80/443 (and 6881/udp), otherwise opening
+`iptables` alone still fails validation.
+
 Make it survive reboots:
 
 ```sh
@@ -428,17 +448,24 @@ metrics `/readyz`, web polls `/healthz`).
 ### 6. HTTPS via Caddy (optional)
 
 The default is plain HTTP on port 80. For HTTPS instead, free host port 80
-and 443 for Caddy by reverting the web service to localhost-only:
+and 443 for Caddy by reverting the web service to localhost-only. Keep this
+out of the tracked `docker-compose.yml` so `git pull` stays clean — put it in
+the untracked `deploy/docker-compose.override.yml` (created in the update
+section) with `!override` so it *replaces* the default `80:8080` publish instead
+of appending a second one:
 
 ```yaml
-# deploy/docker-compose.yml, service `web`
-ports:
-  - "127.0.0.1:8080:8080"
+# deploy/docker-compose.override.yml
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:8080:8080"
 ```
 
 ```sh
 cd deploy
 docker compose up -d
+sudo ss -tlnp | grep -E ':80|:443|:8080'   # want: caddy on *:80,*:443, docker-proxy on 127.0.0.1:8080
 ```
 
 Then install Caddy on the host (not in Compose, so certificate state
@@ -457,11 +484,15 @@ sudo apt-get install -y caddy
 Copy `deploy/Caddyfile` to the system location with your domain in it, and
 check it parses (the file has no access log on purpose — query text is part
 of the URL, so logging requests would store visitors' IPs next to their
-searches; do not add a `log` directive):
+searches; do not add a `log` directive). For apex + www use one comma-separated
+site line — Caddy obtains one certificate per name:
 
 ```sh
-sed 's/search\.example\.org/your.domain/' deploy/Caddyfile | sudo tee /etc/caddy/Caddyfile > /dev/null
+sed 's/search\.example\.org/your.domain, www.your.domain/' deploy/Caddyfile | sudo tee /etc/caddy/Caddyfile > /dev/null
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+# expect `Valid configuration`; the `Unnecessary header_up X-Forwarded-For`
+# warning is expected — the line stays so a client-supplied header is
+# replaced rather than appended.
 ```
 
 The apt package already ships a systemd unit (`caddy.service`) that runs
@@ -476,23 +507,45 @@ journalctl -u caddy --since '5 min ago' --no-pager   # expect "certificate obtai
 
 Caddy fetches the certificate automatically on first start, provided DNS
 already points at the host and ports 80/443 are open (step 4). If it fails,
-the journal shows the ACME error — usually DNS not propagated yet or port 80
-blocked; fix the cause and `sudo systemctl restart caddy`. Certificate files
-and ACME state live in `/var/lib/caddy` on the host (no container to wipe
-them); include that directory in backups alongside the database.
+the journal shows the ACME error: `Error getting validation data` on
+`http-01`/`tls-alpn-01` means Let's Encrypt cannot reach Caddy — re-check
+`iptables -L INPUT -n --line-numbers -v` order (step 4), `ss -tlnp` (Caddy on
+`*:80,*:443`), and the cloud security list. DNS propagation alone shows a
+different error. Fix the cause and `sudo systemctl reload caddy` (or `restart`
+if reload fails). Certificate files and ACME state live in `/var/lib/caddy` on
+the host (no container to wipe them); include that directory in backups
+alongside the database.
 
-Verify end to end, then turn on HSTS:
+Verify end to end, then turn on HSTS. Behind host Caddy the proxy reaches the
+container via localhost, so extend the trusted proxy set in the same
+`override.yml` (base file only trusts the Docker frontend subnet) and set HSTS
+there too — never edit tracked files for machine tuning:
+
+```yaml
+# deploy/docker-compose.override.yml, service `web`, alongside the ports above
+services:
+  web:
+    environment:
+      DC4_WEB__TRUSTED_PROXIES: "127.0.0.1, 172.30.80.0/24"
+      DC4_WEB__HSTS: "true"   # HTTPS only, after curl below passes
+```
 
 ```sh
+cd deploy
+docker compose up -d   # no rebuild: env/ports only
 curl -sI https://your.domain | head -5      # HTTP/2 200, no Server header
 curl -s http://your.domain/ -o /dev/null -w '%{redirect_url}\n'   # → https://
+curl -sI https://your.domain | grep -i strict  # HSTS present after web recreates
 ```
+
+Minimal images lack `dig`/`host`; DNS can be checked with
+`python3 -c "import socket; print(socket.gethostbyname('your.domain'))"` on
+both the build box and the host.
 
 Future config changes: edit `/etc/caddy/Caddyfile`, re-run `caddy validate`
 as above, then `sudo systemctl reload caddy` (zero-downtime; `restart` only
 if reload fails). Browse to `https://your.domain` — the home page shows zero
-torrents at first. That is normal (next step). Set `DC4_WEB__HSTS: "true"`
-(step 3) once HTTPS works.
+torrents at first. That is normal (next step).
 
 ### 7. What happens next (be patient)
 
