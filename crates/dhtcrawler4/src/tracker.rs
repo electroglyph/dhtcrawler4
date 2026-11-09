@@ -113,10 +113,10 @@ impl Default for TrackerConfig {
             trackers: Vec::new(),
             list_url: String::new(),
             list_refresh: Duration::from_secs(86_400),
-            announces_per_key: 5,
-            scrape_fanout: 3,
+            announces_per_key: 2,
+            scrape_fanout: 1,
             packets_per_sec: 200,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(3),
             peer_port: 6881,
         }
     }

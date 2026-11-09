@@ -15,15 +15,15 @@ dhtcrawler4 is a fork of [dhtcrawler3](https://github.com/poonasor/dhtcrawler3) 
 
 
 - **Removed content moderation:** report form, CSRF, `dc4-policy` crate, blocked-terms list, denylist/block pages, report/denylist tables, policy fuzz target.
-- **Added seeder scrapes (BEP 33):** the crawler now asks peers how many seeders each torrent has on its own bandwidth budget, shows seeder counts in search with `sort=seeders`, drops dead torrents, and remembers removed keys for 7→28→90 days.
-- **Server-sized crawl throughput:** a single claimer bulk-claims 512 keys per scan and feeds 8-key batches to the workers over a bounded channel (one queue scan per 512 keys instead of one per worker), each batch recorded in a single database transaction (falling back to one key at a time when a batch is rejected), with tighter fetch timeouts, a bigger scrape budget, 1024 sampler workers, and a larger database connection pool plus gauges to watch it.
+- **Added seeder scrapes (BEP 33):** the crawler now asks peers how many seeders each torrent has on its own bandwidth budget, shows seeder counts in search with `sort=seeders`, drops dead torrents, and remembers removed keys for 14→56→90 days.
+- **Server-sized crawl throughput:** a single claimer bulk-claims 512 keys per scan and feeds 8-key batches to the workers over a bounded channel (one queue scan per 512 keys instead of one per worker), each batch recorded in a single database transaction (falling back to one key at a time when a batch is rejected), with tighter fetch timeouts, a bigger scrape budget, 256 sampler workers, and a larger database connection pool plus gauges to watch it.
 - **Live keys claim first:** the claimer leases keys with a positive seeder estimate before fresh unscraped ones, so live retries jump the queue; `dc4_claimed_total{live="true"|"false"}` shows the mix.
 - **Fetch effort follows the estimate:** dhtcrawler3 spent 8 dials and one lookup on every key; now dead or unscraped keys get 3 dials and one lookup, 1–4 seeders keep 8 dials, 5+ get a second lookup; per-bucket `dc4_fetch_total{est}` / `dc4_fetch_dials_total{est}` prove the pay.
 - **Dedicated fetch budget:** dhtcrawler3 ran fetch traversals on the 100/s scrape bucket; this fork gives them their own 6000/s bucket and leaves scrapes the uncontended 100/s. New `dc4_lookup_duration_seconds{kind}` histogram; dhtcrawler3's single `throttled` drop label is split per site (update dashboards matching the old label).
 - **Retry hints:** peers found during a lookup are remembered (8 per key) so the retry dials known-good peers first instead of re-traversing; `dc4_hint_added/used_total` and `dc4_hint_age_seconds` show whether hints pay.
 - **Live-neighborhood sampling:** dhtcrawler3 sampled only by walking the routing-table frontier; now 25% of sampler picks query a known-live address directly; dead addresses evict after 3 failures. Kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`.
-- **Multi-identity operation:** dhtcrawler3 runs a single node ID; `crawl.identities` (1–8) runs several at once, each on its own UDP port (`dht_port + i`); lookups go out through the closest identity and fan out when it finds nothing. Start with 2–4, not 8.
-- **UDP tracker hybrid:** dhtcrawler3 is DHT-only; this fork also scrapes every claimed key at 3 random UDP trackers, and announces keys with seeders at 5 with a one-shot `started`; dead trackers mean DHT-only, nothing breaks. On by default; `tracker_enabled=false` turns it off. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation.
+- **Multi-identity operation:** dhtcrawler3 runs a single node ID; `crawl.identities` (1–8, default 3) runs several at once, each on its own UDP port (`dht_port + i`); lookups go out through the closest identity and fan out when it finds nothing. Default is 3 (ports 6881-6883).
+- **UDP tracker hybrid:** dhtcrawler3 is DHT-only; this fork also scrapes every claimed key at 1 random UDP tracker, and announces keys with seeders at 2 with a one-shot `started`; dead trackers mean DHT-only, nothing breaks. On by default; `tracker_enabled=false` turns it off. Announces expose our IP per hash to tracker operators, same exposure class as DHT participation.
 - **Store durability:** deleted torrents stay reported-as-deleted so slow indexers still converge, database permissions repair themselves on migrate, refetched torrents come back to life with their liveness data intact, and counters can't overflow.
 - **Cookie theme switch, still no JavaScript:** header dark/light toggle via `POST /theme` (`theme` cookie, dark default). Removed `/.well-known/security.txt` and the `web.base_url` setting (old configs must drop that key).
 - **Hardened DHT / parsing / fetch:** stricter peer identity and routing-table rules, IPv6 rate limits, memory-safe parsing of torrent files, and deadline + retry handling for metadata fetch.
@@ -43,7 +43,8 @@ DNS name pointing at it.
 
 Sizing is the same as the Docker path: at least 4 GiB RAM, tens of GiB of
 disk to start (100+ GiB comfortable — the database and index grow with the
-corpus), and UDP 6881 reachable from the internet.
+corpus), and UDP 6881-6883 reachable from the internet (default
+`crawl.identities = 3`, one port per identity).
 
 ### 1. Service user and directories
 
@@ -146,8 +147,8 @@ sudoedit /etc/dhtcrawler4/dhtcrawler4.toml
 
 Change in `[database]`: `host = "127.0.0.1"` (leave port 5432, name `dc4`).
 On a server, also raise `max_connections`: it sizes each role's database
-pool and the default 8 is lean for 6144 fetch workers (the Docker deployment
-runs crawl at 128 via `DC4_DATABASE__MAX_CONNECTIONS`). Keep the sum across
+pool and the default 8 is lean for 8192 fetch workers (the Docker deployment
+runs crawl at 48 via `DC4_DATABASE__MAX_CONNECTIONS`). Keep the sum across
 roles comfortably under PostgreSQL's own `max_connections` — the stock
 default of 100 leaves little headroom once you raise the crawl pool (the
 Docker deployment sets 200).
@@ -294,8 +295,8 @@ systemctl restart dhtcrawler4-web
 
 The fastest deployment is Docker Compose on Ubuntu 24.04: PostgreSQL plus
 three `dhtcrawler4` roles (crawl, index, web) on isolated networks. The site
-serves plain HTTP on host port 80 by default; Caddy on the host for HTTPS is
-optional (step 6). Everything below assumes a fresh Ubuntu 24.04
+serves plain HTTP on localhost `127.0.0.1:8080` by default; put Caddy on the
+host for public HTTPS (step 6). Everything below assumes a fresh Ubuntu 24.04
 machine with a public IPv4 address (IPv6 optional but recommended) and a DNS
 name pointing at it, e.g. `search.example.org`.
 
@@ -313,7 +314,7 @@ Minimum that works without OOM kills (these are the compose `mem_limit`s):
 Use a host with at least 10 GiB RAM (about 8.75 GiB of caps plus room for
 the OS and Docker itself). Disk: tens of GiB to start; the database
 and the search index grow as torrents are discovered, so leave room (100+ GiB
-is comfortable). One UDP port must be reachable from the internet: **6881**.
+is comfortable). Three UDP ports must be reachable from the internet by default: **6881-6883** (one per `crawl.identities`, default 3).
 
 ### 1. Install Docker
 
@@ -365,7 +366,7 @@ DC4_WEB__HSTS: "true"                             # HTTPS only
 `hsts` makes the site send `Strict-Transport-Security`, so only enable it
 once HTTPS actually works — over plaintext it does nothing at best, and at
 worst tells browsers to refuse the site. Everything else already has sane
-defaults: the web UI serves host port 80 (plain HTTP), PostgreSQL
+defaults: the web UI serves localhost `127.0.0.1:8080` (plain HTTP), PostgreSQL
 has no published port at all, and each role connects with its own
 least-privilege database user (table privileges are granted by the
 migrations, which run as `dc4_owner`).
@@ -380,9 +381,9 @@ out:
 sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 sudo iptables -A INPUT -i lo -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT    # SSH: keep this
-sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT    # web UI
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT    # web UI (only if Caddy publishes it; default web is localhost-only)
 sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT   # only needed for HTTPS
-sudo iptables -A INPUT -p udp --dport 6881 -j ACCEPT  # DHT
+sudo iptables -A INPUT -p udp --dport 6881:6883 -j ACCEPT  # DHT (one port per identity, default 3)
 sudo iptables -P INPUT DROP
 ```
 
@@ -394,16 +395,16 @@ instead:
 
 ```sh
 sudo iptables -L INPUT -n --line-numbers -v
-# want: ACCEPT 22, 80, 443, 6881/udp all *before* any REJECT, policy DROP.
+# want: ACCEPT 22, 80, 443, 6881:6883/udp all *before* any REJECT, policy DROP.
 # If 80/443 sit after a REJECT, fix with (example: REJECT is line 5):
 sudo iptables -I INPUT 5 -p tcp --dport 80 -j ACCEPT
 sudo iptables -I INPUT 6 -p tcp --dport 443 -j ACCEPT
-sudo iptables -I INPUT 7 -p udp --dport 6881 -j ACCEPT
+sudo iptables -I INPUT 7 -p udp --dport 6881:6883 -j ACCEPT
 sudo iptables -L INPUT -n --line-numbers -v   # re-check order, delete stale duplicates
 ```
 
 Cloud firewalls are separate from `iptables`: on OCI the VCN security list /
-NSG must also allow ingress 80/443 (and 6881/udp), otherwise opening
+NSG must also allow ingress 80/443 (and 6881-6883/udp), otherwise opening
 `iptables` alone still fails validation.
 
 Make it survive reboots:
@@ -413,7 +414,9 @@ sudo apt-get install -y iptables-persistent
 sudo netfilter-persistent save
 ```
 
-Port 80 is intentionally public now; everything else stays closed.
+Port 80 is intentionally public only when Caddy is in front (the default
+web publish is localhost-only `127.0.0.1:8080`); the DHT ports 6881-6883
+stay open. Everything else stays closed.
 (Docker forwards published ports through its own chains, so the rules above
 guard the host's own ports; container traffic is unaffected.)
 
@@ -428,7 +431,8 @@ Startup order is enforced with health gates: `db` (Postgres 18 initialises
 the data directory, creates the `dc4` database and the four roles via
 `postgres/init/10-roles.sh`) → `migrate` (applies the SQL migrations in
 `crates/dc4-store`) → `crawl`, `index`, `web`. The crawl role publishes
-UDP 6881; the web role publishes host port 80 (plain HTTP).
+UDP 6881-6883 (one per identity, default 3); the web role publishes
+localhost `127.0.0.1:8080` (put Caddy in front for public 80/443).
 
 Check it came up:
 
@@ -447,19 +451,20 @@ metrics `/readyz`, web polls `/healthz`).
 
 ### 6. HTTPS via Caddy (optional)
 
-The default is plain HTTP on port 80. For HTTPS instead, free host port 80
-and 443 for Caddy by reverting the web service to localhost-only. Keep this
-out of the tracked `docker-compose.yml` so `git pull` stays clean — put it in
-the untracked `deploy/docker-compose.override.yml` (created in the update
-section) with `!override` so it *replaces* the default `80:8080` publish instead
-of appending a second one:
+The default web publish is already localhost-only (`127.0.0.1:8080`), so
+Caddy on the host can take public 80/443 without touching Compose ports.
+Keep host tuning out of the tracked `docker-compose.yml` so `git pull`
+stays clean — put HSTS and proxy trust in the untracked
+`deploy/docker-compose.override.yml` (created in the update section):
 
 ```yaml
-# deploy/docker-compose.override.yml
+# deploy/docker-compose.override.yml — ports are already localhost-only by
+# default; this only adds HSTS + proxy trust for public HTTPS
 services:
   web:
-    ports: !override
-      - "127.0.0.1:8080:8080"
+    environment:
+      DC4_WEB__HSTS: "true"   # HTTPS only, after curl below passes
+      DC4_WEB__TRUSTED_PROXIES: "127.0.0.1, 172.30.80.0/24"
 ```
 
 ```sh
@@ -560,8 +565,8 @@ torrents at first. That is normal (next step).
 
 Expect the first searchable torrents within minutes and a steadily growing
 index over hours to days. The default crawl budget (`max_packets_per_sec =
-12000`, `fetch_packets_per_sec = 6000` for fetch traversals
-(`DC4_CRAWL__FETCH_PACKETS_PER_SEC`), 6144 fetch
+6000`, `fetch_packets_per_sec = 6000` for fetch traversals
+(`DC4_CRAWL__FETCH_PACKETS_PER_SEC`), 8192 fetch
 workers) is sized for a server; lower it in
 `deploy/config/dhtcrawler4.toml` on a home connection. Trap: setting
 `fetch_packets_per_sec` (or any packet budget) to `"0"` means "treated as
@@ -583,7 +588,7 @@ docker compose ps                     # includes healthcheck status
   port).
 - **Database pool pressure:** `dc4_db_pool_size` vs `dc4_db_pool_idle` on the
   crawl role. Idle pinned near zero means the pool is saturated — raise
-  `DC4_DATABASE__MAX_CONNECTIONS` (compose sets 128) and PostgreSQL's
+  `DC4_DATABASE__MAX_CONNECTIONS` (compose sets 48) and PostgreSQL's
   `max_connections` (compose sets 200) together, never just one side.
   Queue write churn is already tamed where it matters: the crawler commits
   asynchronously (`ALTER ROLE dc4_crawler SET synchronous_commit = off` in
@@ -617,10 +622,29 @@ docker compose ps                     # includes healthcheck status
   pre-req is `concurrent_observes_do_not_lose_seen_counts` in `crates/dc4-store/src/tests.rs`.
 - Budget: 8x packet budget (~12 MB/s at full reply rate), 8x RAM/sockets/DB pool.
 - Start with 2-4 replicas, compare the `discovered` slope, then scale to 8.
-- Alternative: `crawl.identities = N` (1-8, `DC4_CRAWL__IDENTITIES`) runs N node
-  IDs in one process instead of N processes: ports `dht_port..dht_port+N-1`
-  per family, own routing table per identity, everything else shared. Publish
-  the port range and start with 2-4; back to `1` plus a restart to roll back.
+- Default is `crawl.identities = 3` (1-8, `DC4_CRAWL__IDENTITIES`) in one
+  process instead of N processes: ports `dht_port..dht_port+N-1`
+  per family (default `6881-6883`), own routing table per identity,
+  everything else shared. To change N, set the env, republish the port range,
+  and open the same range on the firewall, then `up -d` (no rebuild for
+  env/ports-only changes):
+  ```yaml
+  # deploy/docker-compose.override.yml — e.g. back to 1 identity
+  services:
+    crawl:
+      environment:
+        DC4_CRAWL__IDENTITIES: "1"
+      ports: !override
+        - "6881:6881/udp"
+  ```
+  ```sh
+  # firewall must match the port range (example for default N=3)
+  sudo iptables -I INPUT 7 -p udp --dport 6881:6883 -j ACCEPT
+  sudo netfilter-persistent save
+  cd deploy && docker compose up -d
+  docker compose ps   # crawl shows 6881-6883->6881-6883/udp when N=3
+  ```
+  Start with the default 3; back to `1` plus a restart to roll back.
   Extra identities cost ~2-5 MB RAM each; abort past ~15 MB/identity.
   Outbound lookups route per family through the XOR-closest identity and fan
   out to the remaining identities when the closest finds nothing; a port
@@ -848,9 +872,10 @@ How to read the output:
   with attempts near 0 means junk discovery, and `dc4_admitted_total` by
   `source` shows where it comes from.
 - **Is the DHT side healthy?** `dc4_dht_good_nodes` in the hundreds with
-  `dc4_dht_timeouts_total` a small fraction of `dc4_dht_samples_total` is fine.
+  `dc4_dht_timeouts_total` a small fraction of `dc4_dht_samples_total` is fine
+  (expect ~400 with default 3 identities vs ~150 with 1).
   `dc4_dht_queries_received_total` climbing (especially `get_peers`) proves
-  inbound UDP 6881 works — near zero means the internet cannot reach
+  inbound UDP 6881-6883 works — near zero means the internet cannot reach
   the node: fix the firewall/security group, no config knob compensates.
   All-zero `v6` lines just mean no working IPv6 (harmless). 25% of sampler picks probe known-live addresses directly (`sampler_live_share`, kill with `DC4_CRAWL__SAMPLER_LIVE_SHARE: "0"`); `dc4_dht_sampler_live_evicted_total` climbing fast means the ring is full of dead addrs.
 - **Is the queue moving?** `dc4_claim_chan_depth` fluctuating under 256
@@ -877,7 +902,7 @@ How to read the output:
   per-key worker time into `lookup`/`triage`/`dial`/`store`/`total` — the
   stage with the biggest p50 is where throughput work goes; `total` counts
   joined against `dc4_fetch_total` reveal the `key_deadline`-hit share
-  (dropped keys record nothing). Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 5), `tracker_scrape_fanout` (1..=4, default 3), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 5). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
+  (dropped keys record nothing). Tracker-sourced peers show as dials with no matching DHT lookup: `dc4_tracker_announces_total{outcome="ok"}` climbing with `dc4_tracker_peers_total` means the hybrid is paying; `no_live` means every server is dead (fetch stays DHT-only, safe). Kill instantly with `DC4_CRAWL__TRACKER_ENABLED: "false"` plus `up -d` (no rebuild); pin servers with `DC4_CRAWL__TRACKERS` if the public list misbehaves. Remaining tracker knobs: `tracker_list_url` (`DC4_CRAWL__TRACKER_LIST_URL`, default `""` = refresh off — the tree has no TLS client, so point it at a plain-`http://` mirror to enable; refresh every `tracker_list_refresh_secs`, 3600..=604800), `tracker_announces_per_key` (1..=8, default 2), `tracker_scrape_fanout` (1..=4, default 1), `tracker_packets_per_sec` (default 200; scrape flushes charge 2 packets/server = connect + scrape, announces 2/server), `tracker_timeout_secs` (default 3). Announces expose our IP per hash to tracker operators, same exposure class as DHT participation: `started`-only one-shots to a random subset per key (never the whole list; retries draw from unfloored servers first so one floored pick never blocks unfloored capacity), announces carry `left=1` (leecher — `0` would falsely claim seeder), per-(key,tracker) re-announce floors of `max(interval, 60s)`, liveness probes ~1 packet/server/hour, per-tracker series bounded (<= 32 servers). Implementation notes: one socket per pool (fewer FDs than one-per-tracker, same pipelining); first-seen tracker addresses start live optimistically and traffic/sweeps evict the dead (no blocking connect probe at startup). See the `dc4-tracker` crate docs for the full good-citizen subset.
 - **Index and web alive?** `dc4_index_lag` near zero with `dc4_index_docs`
   tracking the torrent count means the indexer keeps up;
   `dc4_scrape_due_depth` stuck high means the scrape queue never catches

@@ -461,9 +461,9 @@ mod tests {
 
     #[test]
     fn tuning_carries_the_gave_up_purge_grace() {
-        // Default 1 hour, straight through to the sweep.
+        // Default 0 (immediate), straight through to the sweep.
         let tuning = ScrapeTuning::from_config(&CrawlConfig::default());
-        assert_eq!(tuning.gave_up_purge, Duration::from_secs(3600));
+        assert_eq!(tuning.gave_up_purge, Duration::from_secs(0));
     }
 
     /// The sweep leg purges only gave-up rows older than the grace, with no

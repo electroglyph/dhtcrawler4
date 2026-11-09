@@ -32,10 +32,10 @@ bind_v4 = "0.0.0.0"
 # IPv6 DHT (BEP 32). Disabled automatically, with a warning, when the host has no
 # global IPv6 address. Set to "" to disable it explicitly.
 bind_v6 = "::"
-# In-process DHT identities (1-8, default 1). Each binds `dht_port + i` per
+# In-process DHT identities (1-8, default 3). Each binds `dht_port + i` per
 # family with its own node ID and routing table, sharing everything else.
 # With N > 1, publish/allow the whole port range (dht_port..dht_port+N-1).
-identities = 1
+identities = 3
 bootstrap = [
   "dht.libtorrent.org:25401",
   "dht.transmissionbt.com:6881",
@@ -47,13 +47,12 @@ state_dir = "/var/lib/dhtcrawler4"
 # Global outbound DHT packet budget. Sized for a server; lower it on a
 # home connection. Politeness toward any single node comes from the 1 s
 # per-address query spacing, so this aggregate only bounds total wire bytes
-# (~6 MB/s total at full reply rate: ~1.2 out + ~4.8 in at typical
-# response sizes).
-max_packets_per_sec = 12000
+# (~3 MB/s total at full reply rate with the 6000/s default).
+max_packets_per_sec = 6000
 # Sampler workers (one query each at a time): timeout-bound mixes sustain
 # roughly concurrency / 2 s sends (sampler queries time out after 2 s),
 # so this floors worst-case discovery.
-sampler_concurrency = 1024
+sampler_concurrency = 256
 # Fraction of sampler picks that probe a live address directly instead of
 # traversing the frontier (0.0-1.0; 0 disables). Live stores skew toward
 # live swarms; uniform-node samples are mostly dead. A reallocation inside
@@ -62,13 +61,13 @@ sampler_live_share = 0.25
 # Answer no DHT queries and mark ours read-only (BEP 43). Leave false to be a
 # full, reciprocating DHT node.
 read_only = false
-fetch_workers = 6144
+fetch_workers = 8192
 max_connections = 24576
 max_metadata_bytes = 8388608
 # Total metadata bytes held by all fetches at once (memory bound).
 max_inflight_metadata_bytes = 1073741824
 # Keys waiting for metadata. Above this, only sampled and announced keys are queued.
-max_pending = 5000000
+max_pending = 2000000
 # BEP 33 seeder scrapes: dedicated workers re-poll stored torrents for their
 # current seeder count and tombstone dead swarms. Defaults keep up with ~100k
 # torrents; without the node-list cache a million torrents need a higher
@@ -94,8 +93,7 @@ scrape_packets_per_sec = 100
 # Dedicated outbound packet budget for fetch traversals (burst: 1s).
 # Fetch runs ~2,000 lookups/s measured, so 6000 gives ~3x headroom; fetch
 # alone can never be the binding constraint. Total default egress is
-# 12k main + 6k fetch + 100 scrape (~18.1k, up ~6k/s over the old
-# 12k-only envelope).
+# 6k main + 6k fetch + 100 scrape (~12.1k).
 fetch_packets_per_sec = 6000
 # UDP tracker hybrid: scrape triage plus one-shot announces for
 # triage-positive keys. Enabled by default; false means DHT-only fetch and
@@ -114,24 +112,24 @@ tracker_list_url = ""
 # Seconds between list refreshes.
 tracker_list_refresh_secs = 86400
 # Random live trackers announced per triage-positive key.
-tracker_announces_per_key = 5
+tracker_announces_per_key = 2
 # Random live trackers scraped per triage batch.
-tracker_scrape_fanout = 3
+tracker_scrape_fanout = 1
 # Pool-wide tracker packet budget.
 tracker_packets_per_sec = 200
 # Per-RPC timeout of tracker queries.
-tracker_timeout_secs = 5
+tracker_timeout_secs = 3
 # Base admission cooldown of a removed key, in days; repeats escalate
-# 7 -> 30 -> 90 days (the cap is not a knob).
-removal_cooldown_days = 7
+# 14 -> 56 -> 90 days (the cap is not a knob).
+removal_cooldown_days = 14
 # Grace before a tombstoned row is hard-purged, in hours.
 tombstone_purge_hours = 1
 # Age before a gave-up queue row is hard-purged, in hours. Gave-up rows count
 # against max_pending without ever becoming claimable again, so this must stay
 # short enough that corpses leave faster than failures arrive.
-gave_up_purge_hours = 1
+gave_up_purge_hours = 0
 # Interval of the tombstone-purge sweep, in seconds.
-scrape_sweep_secs = 3600
+scrape_sweep_secs = 600
 # Re-scrape interval of rows whose swarm is still unknown (30 days): unknown
 # rows cost lookups without answers, so they are re-polled less often. Must
 # be at least scrape_interval_secs.

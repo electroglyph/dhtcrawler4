@@ -149,7 +149,7 @@ impl Default for AdmissionTuning {
             retry_max: FLUSH_RETRY_MAX,
             shutdown_flush_timeout: SHUTDOWN_FLUSH_TIMEOUT,
             get_peers_single_cap: GET_PEERS_SINGLE_CAP,
-            removal_cooldown_days: 7,
+            removal_cooldown_days: 14,
         }
     }
 }
@@ -1712,10 +1712,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        // Two days into the 7d cooldown a plain announce is still blocked
-        // (5d left), while a seed announce is admitted (7/4 = 1.75d < 2d):
+        // Four days into the 14d cooldown a plain announce is still blocked
+        // (10d left), while a seed announce is admitted (14/4 = 3.5d < 4d):
         // shortening, never bypassing — a fresh removal still blocks.
-        tokio::time::advance(Duration::from_secs(2 * 24 * 60 * 60)).await;
+        tokio::time::advance(Duration::from_secs(4 * 24 * 60 * 60)).await;
         let t0 = Instant::now();
         a.handle(event(dead, Source::Announce, "1.2.3.4", None), &own, t0);
         let out = a.flush(None, None).await.unwrap();
@@ -1750,9 +1750,9 @@ mod tests {
                     .unwrap()
             );
         }
-        // Two days into the 7d cooldown a first flush blocks everything
+        // Four days into the 14d cooldown a first flush blocks everything
         // and caches the verdicts.
-        tokio::time::advance(Duration::from_secs(2 * 24 * 60 * 60)).await;
+        tokio::time::advance(Duration::from_secs(4 * 24 * 60 * 60)).await;
         let t0 = Instant::now();
         for k in &all {
             a.handle(event(*k, Source::Announce, "1.2.3.4", None), &own, t0);

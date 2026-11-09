@@ -542,7 +542,7 @@ mod tests {
         );
         assert_eq!(o.dht.bootstrap.len(), 4);
         assert!(o.dht.sampler);
-        assert_eq!(o.dht.sampler_concurrency, 1024);
+        assert_eq!(o.dht.sampler_concurrency, 256);
         assert!(!o.dht.allow_private_addrs);
         assert_eq!(o.dht.tuning, DhtTuning::default());
         assert!(o.dht.validate().is_ok());
@@ -553,7 +553,7 @@ mod tests {
             o.dht.fetch_packets_per_sec,
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
-        assert_eq!(o.dht.identities, 1);
+        assert_eq!(o.dht.identities, 3);
         assert!(o.tracker.enabled);
         assert_eq!(
             o.tracker.announces_per_key,
@@ -564,10 +564,10 @@ mod tests {
         assert_eq!(o.dht.tuning.scrape_query_timeout, Duration::from_secs(10));
         assert_eq!(o.dht.tuning.scrape_node_cache_keys, 4096);
         assert_eq!(o.dht.bep42_r, None);
-        assert_eq!(o.admission.removal_cooldown_days, 7);
+        assert_eq!(o.admission.removal_cooldown_days, 14);
         assert_eq!(o.scrape_workers, 1);
         assert_eq!(o.scrape.threshold, 0);
-        assert_eq!(o.max_pending, 5_000_000);
+        assert_eq!(o.max_pending, 2_000_000);
         assert_eq!(o.limits.max_connections, Config::default().crawl.max_connections);
         assert_eq!(o.limits.max_inflight_metadata_bytes, 1_073_741_824);
         assert_eq!(o.min_good_nodes, MIN_GOOD_NODES);

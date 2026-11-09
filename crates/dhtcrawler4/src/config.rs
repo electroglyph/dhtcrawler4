@@ -222,7 +222,7 @@ pub struct CrawlConfig {
     /// (`TokenBucket::new` treats 0 as 1); rollback is revert + rebuild.
     pub fetch_packets_per_sec: u32,
     /// Base admission cooldown of a removed key, in days; repeats escalate
-    /// 7 -> 28 -> 90 days (capped, not a knob).
+    /// base, then x4, then the 90d cap (not a knob).
     pub removal_cooldown_days: u64,
     /// Grace before a tombstoned row is hard-purged, in hours.
     pub tombstone_purge_hours: u64,
@@ -274,16 +274,16 @@ impl Default for CrawlConfig {
                 .map(|s| (*s).to_owned())
                 .collect(),
             state_dir: PathBuf::from("/var/lib/dhtcrawler4"),
-            max_packets_per_sec: dc4_dht::DEFAULT_MAX_PACKETS_PER_SEC,
-            sampler_concurrency: dc4_dht::DEFAULT_SAMPLER_CONCURRENCY,
-            identities: 1,
+            max_packets_per_sec: 6_000,
+            sampler_concurrency: 256,
+            identities: 3,
             sampler_live_share: 0.25,
             read_only: false,
-            fetch_workers: 6144,
+            fetch_workers: 8192,
             max_connections: 24576,
             max_metadata_bytes: dc4_peer::DEFAULT_MAX_METADATA,
             max_inflight_metadata_bytes: 1024 * 1024 * 1024,
-            max_pending: 5_000_000,
+            max_pending: 2_000_000,
             scrape_workers: 1,
             scrape_interval_secs: 7 * 24 * 60 * 60,
             scrape_batch: 64,
@@ -294,10 +294,10 @@ impl Default for CrawlConfig {
             scrape_concurrency: 3,
             scrape_packets_per_sec: dc4_dht::DEFAULT_SCRAPE_PACKETS_PER_SEC,
             fetch_packets_per_sec: dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC,
-            removal_cooldown_days: 7,
+            removal_cooldown_days: 14,
             tombstone_purge_hours: 1,
-            gave_up_purge_hours: 1,
-            scrape_sweep_secs: 3600,
+            gave_up_purge_hours: 0,
+            scrape_sweep_secs: 600,
             scrape_unknown_interval_secs: 30 * 24 * 60 * 60,
             scrape_node_cache_keys: 4096,
             scrape_early_exit_quorum: 3,
@@ -305,10 +305,10 @@ impl Default for CrawlConfig {
             trackers: Vec::new(),
             tracker_list_url: String::new(),
             tracker_list_refresh_secs: 86_400,
-            tracker_announces_per_key: 5,
-            tracker_scrape_fanout: 3,
+            tracker_announces_per_key: 2,
+            tracker_scrape_fanout: 1,
             tracker_packets_per_sec: 200,
-            tracker_timeout_secs: 5,
+            tracker_timeout_secs: 3,
             bep42_r: None,
         }
     }
@@ -1406,7 +1406,7 @@ mod tests {
             "max_connections=200",
             "checkpoint_timeout=900",
             "max_wal_size=4GB",
-            "DC4_DATABASE__MAX_CONNECTIONS: \"128\"",
+            "DC4_DATABASE__MAX_CONNECTIONS: \"48\"",
         ] {
             assert!(COMPOSE.contains(needle), "compose lost {needle}");
         }
@@ -1425,7 +1425,7 @@ mod tests {
             );
         }
         for needle in [
-            "compose sets 128",
+            "compose sets 48",
             "synchronous_commit = off",
             "checkpoint_timeout=900",
             "max_wal_size=4GB",
@@ -1834,7 +1834,7 @@ mod tests {
             c.fetch_packets_per_sec,
             dc4_dht::DEFAULT_FETCH_PACKETS_PER_SEC
         );
-        assert_eq!(c.identities, 1);
+        assert_eq!(c.identities, 3);
         assert!(c.tracker_enabled);
         assert!(c.trackers.is_empty());
         assert!(c.tracker_list_url.is_empty());
@@ -1848,11 +1848,11 @@ mod tests {
             CrawlConfig::default().tracker_scrape_fanout
         );
         assert_eq!(c.tracker_packets_per_sec, 200);
-        assert_eq!(c.tracker_timeout_secs, 5);
-        assert_eq!(c.removal_cooldown_days, 7);
+        assert_eq!(c.tracker_timeout_secs, 3);
+        assert_eq!(c.removal_cooldown_days, 14);
         assert_eq!(c.tombstone_purge_hours, 1);
-        assert_eq!(c.gave_up_purge_hours, 1);
-        assert_eq!(c.scrape_sweep_secs, 3600);
+        assert_eq!(c.gave_up_purge_hours, 0);
+        assert_eq!(c.scrape_sweep_secs, 600);
         assert_eq!(c.scrape_unknown_interval_secs, 2592000);
         assert_eq!(c.scrape_node_cache_keys, 4096);
         assert_eq!(c.scrape_early_exit_quorum, 3);

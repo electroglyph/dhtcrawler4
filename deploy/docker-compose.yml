@@ -89,17 +89,17 @@ services:
     environment:
       <<: *dc4-env
       DC4_DATABASE__USER: dc4_crawler
-      # 6144 fetch workers plus admission and scrapes share this pool.
-      DC4_DATABASE__MAX_CONNECTIONS: "128"
+      # 8192 fetch workers plus admission and scrapes share this pool.
+      DC4_DATABASE__MAX_CONNECTIONS: "48"
     secrets:
       - source: dc4_crawler_password
         target: db_password
     ports:
-      - "6881:6881/udp"   # IPv4 and IPv6. With crawl.identities = N > 1,
+      - "6881-6883:6881-6883/udp"   # IPv4 and IPv6. With crawl.identities = N,
                           # publish "6881-688N:6881-688N/udp" and open the
-                          # same range on the firewall instead.
+                          # same range on the firewall instead (default N=3).
                           # Example for N = 8 (commented: uncomment and drop
-                          # the single-port line above when identities > 1):
+                          # the default line above when identities > 3):
                           # - "6881-6888:6881-6888/udp"
     volumes:
       - state:/var/lib/dhtcrawler4
@@ -149,14 +149,14 @@ services:
       <<: *dc4-env
       DC4_DATABASE__USER: dc4_web
       DC4_WEB__LISTEN: "0.0.0.0:8080"
-      # Connections to the published port arrive from the frontend network's
-      # gateway (docker-proxy), so that subnet is the trusted proxy.
-      DC4_WEB__TRUSTED_PROXIES: "172.30.80.0/24"
+      # Connections to the published port arrive from localhost (Caddy) and the
+      # frontend network's gateway (docker-proxy), so both are trusted.
+      DC4_WEB__TRUSTED_PROXIES: "127.0.0.1, 172.30.80.0/24"
     secrets:
       - source: dc4_web_password
         target: db_password
     ports:
-      - "80:8080"
+      - "127.0.0.1:8080:8080"
     # Tantivy readers take a short-lived lock file, so the index volume is writable here.
     volumes:
       - index:/var/lib/dhtcrawler4/index
